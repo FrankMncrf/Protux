@@ -1,0 +1,143 @@
+# shellcheck shell=bash
+# Traducción al español de los mensajes de protux.
+# Clave = texto en inglés tal cual aparece en el código (formato printf).
+# shellcheck disable=SC2034
+
+PTX_USAGE_ES='Uso: protux <orden> [opciones]
+
+Órdenes:
+  setup             Configuración inicial interactiva (remoto de rclone, punto de montaje, servicio)
+  gui               Abrir la aplicación gráfica (asistente de configuración y ajustes)
+  login [--gui]     Renovar la sesión de Proton con un código 2FA y volver a montar
+  password          Cambiar la contraseña de la cuenta o la segunda contraseña (buzón)
+  open              Abrir la unidad en tu gestor de archivos
+  start | stop | restart
+                    Montar o desmontar la unidad (mediante el servicio de usuario de systemd)
+  enable | disable  Montar automáticamente al iniciar sesión, o dejar de hacerlo
+  status            Mostrar el estado del servicio, el montaje y la sesión
+  logs [-f]         Mostrar el registro del servicio
+  doctor            Revisar dependencias y configuración
+  keyring set|check|clear
+                    Gestionar la contraseña de la config de rclone guardada en el llavero
+  config [edit|path]
+                    Mostrar, editar o ubicar el archivo de configuración
+  version           Mostrar la versión
+'
+
+PTX_TR=(
+  ['2FA dialog: %s']='Ventana del código 2FA: %s'
+  ['ALLOW_OTHER=yes needs user_allow_other in /etc/fuse.conf']='ALLOW_OTHER=yes necesita user_allow_other en /etc/fuse.conf'
+  ['Already mounted at %s']='Ya está montado en %s'
+  ['Cache:']='Caché:'
+  ['Cancel']='Cancelar'
+  ['Check the code and try again.']='Revisa el código y vuelve a intentarlo.'
+  ['Click here to enter your 2FA code.']='Haz clic aquí para escribir el código 2FA.'
+  ['Config password found in the keyring']='Contraseña de la config encontrada en el llavero'
+  ['Config password not in the keyring (protux keyring set)']='La contraseña de la config no está en el llavero (protux keyring set)'
+  ['Config: %s']='Configuración: %s'
+  ['Configuration saved to %s']='Configuración guardada en %s'
+  ['Could not create the rclone remote.']='No se pudo crear el remoto de rclone.'
+  ['Could not log in']='No se pudo iniciar sesión'
+  ['Could not mount. See: protux logs']='No se pudo montar. Revisa: protux logs'
+  ['Could not store the password.']='No se pudo guardar la contraseña.'
+  ['/dev/fuse available']='/dev/fuse disponible'
+  ['/dev/fuse missing (modprobe fuse)']='Falta /dev/fuse (modprobe fuse)'
+  ['Does your Proton account use 2FA? [Y/n] ']='¿Tu cuenta de Proton usa 2FA? [S/n] '
+  ['Done. Your files are in %s']='Listo. Tus archivos están en %s'
+  ['Email and password are required.']='El correo y la contraseña son obligatorios.'
+  ['Enter 2FA code']='Escribir código 2FA'
+  ['Enter the password that encrypts your rclone config:']='Escribe la contraseña que cifra tu config de rclone:'
+  ['Error:']='Error:'
+  ['expired, run: protux login']='caducada, ejecuta: protux login'
+  ['fusermount3 not found (install fuse3)']='No se encontró fusermount3 (instala fuse3)'
+  ['FUSE tools found']='Herramientas FUSE encontradas'
+  ['Hook %s failed (exit %s)']='El hook %s falló (salida %s)'
+  ['Install zenity or kdialog, or run: protux login']='Instala zenity o kdialog, o ejecuta: protux login'
+  ['Keyring not available after %s s (or no password stored: protux keyring set)']='Llavero no disponible tras %s s (o sin contraseña guardada: protux keyring set)'
+  ['Logging in to Proton Drive...']='Iniciando sesión en Proton Drive...'
+  ['Log in']='Iniciar sesión'
+  ['Mount:']='Montaje:'
+  ['Mount automatically at login? [Y/n] ']='¿Montar automáticamente al iniciar sesión? [S/n] '
+  ['(mounted)']='(montado)'
+  ['Mounted.']='Montado.'
+  ['Mounted at %s']='Montado en %s'
+  ['Mounting %s at %s...']='Montando %s en %s...'
+  ['Mountpoint [%s]: ']='Punto de montaje [%s]: '
+  ['Mountpoint %s is not empty']='El punto de montaje %s no está vacío'
+  ['No config file, using defaults (protux setup)']='Sin archivo de configuración, se usan los valores por defecto (protux setup)'
+  ['No config file yet (%s); defaults are in use.']='Aún no hay archivo de configuración (%s); se usan los valores por defecto.'
+  ['No DNS for %s after %s s']='Sin DNS para %s tras %s s'
+  ['No password in the keyring (or the keyring is locked).']='No hay contraseña en el llavero (o está bloqueado).'
+  ['notify-send found']='notify-send encontrado'
+  ['notify-send missing: no desktop notifications (libnotify)']='Falta notify-send: no habrá notificaciones (libnotify)'
+  ['(not mounted)']='(no montado)'
+  ['Not mounted (%s)']='No montado (%s)'
+  ['ok']='correcta'
+  ['Password found in the keyring.']='Contraseña encontrada en el llavero.'
+  ['protux setup']='Configuración de protux'
+  ['Proton account (email): ']='Cuenta de Proton (correo): '
+  ['Proton blocked new logins for a while. I will ask for the 2FA code again in %s.']='Proton bloqueó los inicios de sesión un rato. Te pediré el código 2FA de nuevo en %s.'
+  ['Proton Drive could not be mounted']='Proton Drive no se pudo montar'
+  ['Proton Drive did not mount. See: protux logs']='Proton Drive no se montó. Revisa: protux logs'
+  ['Proton Drive mounted at %s']='Proton Drive montado en %s'
+  ['Proton Drive: session expired']='Proton Drive: sesión caducada'
+  ['Proton Drive: too many login attempts']='Proton Drive: demasiados intentos de inicio de sesión'
+  ['Proton is limiting login attempts (HTTP 429)']='Proton está limitando los inicios de sesión (HTTP 429)'
+  ['Proton is still limiting login attempts (429). Wait a few minutes and try again.']='Proton sigue limitando los intentos (429). Espera unos minutos y vuelve a probar.'
+  ['Proton password: ']='Contraseña de Proton: '
+  ['rate-limited by Proton since %s']='limitada por Proton desde las %s'
+  ['rclone config is encrypted but secret-tool is missing (install libsecret)']='La config de rclone está cifrada pero falta secret-tool (instala libsecret)'
+  ['rclone config not found: %s']='No se encontró la config de rclone: %s'
+  ['rclone config: %s']='Config de rclone: %s'
+  ['rclone not found (%s)']='No se encontró rclone (%s)'
+  ['rclone remote name [%s]: ']='Nombre del remoto de rclone [%s]: '
+  ['rclone: %s']='rclone: %s'
+  ['rclone %s has no protondrive backend (needs 1.64 or newer)']='rclone %s no tiene el backend protondrive (necesita 1.64 o posterior)'
+  ['Remote:']='Remoto:'
+  ['Remote %s already exists; keeping it.']='El remoto %s ya existe; se conserva.'
+  ['Remote %s created.']='Remoto %s creado.'
+  ['Remote %s found']='Remoto %s encontrado'
+  ['Remote %s not found in the rclone config (protux setup)']='No se encontró el remoto %s en la config de rclone (protux setup)'
+  ['secret-tool not found (install libsecret)']='No se encontró secret-tool (instala libsecret)'
+  ['See: protux logs']='Revisa: protux logs'
+  ['Service:']='Servicio:'
+  ['Service enabled at login']='Servicio activado al iniciar sesión'
+  ['Service not enabled (protux enable)']='Servicio no activado (protux enable)'
+  ['Session:']='Sesión:'
+  ['Session renewed.']='Sesión renovada.'
+  ['Session renewed. Mounting the drive...']='Sesión renovada. Montando la unidad...'
+  ['setup is interactive; run it in a terminal.']='setup es interactivo; ejecútalo en una terminal.'
+  ['The code must have 6 digits.']='El código debe tener 6 dígitos.'
+  ['The Proton session expired; a new 2FA login is needed']='La sesión de Proton caducó; hay que volver a entrar con 2FA'
+  ['The Proton session expired. Run: protux login']='La sesión de Proton caducó. Ejecuta: protux login'
+  ['unknown']='desconocida'
+  ['Unknown option: %s']='Opción desconocida: %s'
+  ['Usage: protux config [show|edit|path]']='Uso: protux config [show|edit|path]'
+  ['Usage: protux keyring set|check|clear']='Uso: protux keyring set|check|clear'
+  ['user_allow_other enabled in /etc/fuse.conf']='user_allow_other activado en /etc/fuse.conf'
+  ['Your Proton Drive session expired.\nEnter the 6-digit 2FA code:']='La sesión de Proton Drive caducó.\nEscribe el código 2FA de 6 dígitos:'
+  ['Your rclone config is encrypted; its password will be stored in the keyring.']='Tu config de rclone está cifrada; su contraseña se guardará en el llavero.'
+  ['zenity/kdialog missing: the 2FA code can only be entered in a terminal']='Faltan zenity/kdialog: el código 2FA solo podrá escribirse en una terminal'
+  ['Could not save the credentials in the rclone config.']='No se pudieron guardar las credenciales en la config de rclone.'
+  ['Does your account use a second (mailbox) password? [y/N] ']='¿Tu cuenta usa una segunda contraseña (buzón)? [s/N] '
+  ['Fix it']='Corregir'
+  ['Graphical app installed (protux-gui)']='Aplicación gráfica instalada (protux-gui)'
+  ['Invalid value for %s']='Valor no válido para %s'
+  ['New Proton password (empty = keep): ']='Nueva contraseña de Proton (vacía = conservar): '
+  ['Proton Drive could not log in']='Proton Drive no pudo iniciar sesión'
+  ['Proton asks for a human verification (CAPTCHA); log in once at proton.me from this network and try again']='Proton pide una verificación humana (CAPTCHA); inicia sesión una vez en proton.me desde esta red y vuelve a intentarlo'
+  ['Proton password:']='Contraseña de Proton:'
+  ['Proton rejected the password']='Proton rechazó la contraseña'
+  ['Saved. Run protux login to log in with them.']='Guardado. Ejecuta protux login para entrar con ellas.'
+  ['Second (mailbox) password (empty = keep): ']='Segunda contraseña (buzón) (vacía = conservar): '
+  ['Second (mailbox) password:']='Segunda contraseña (buzón):'
+  ['Second (mailbox) password: ']='Segunda contraseña (buzón): '
+  ['The graphical app is not installed (protux-gui).']='La aplicación gráfica no está instalada (protux-gui).'
+  ['This account needs its second (mailbox) password']='Esta cuenta necesita su segunda contraseña (buzón)'
+  ['This command is interactive; run it in a terminal.']='Esta orden es interactiva; ejecútala en una terminal.'
+  ['Unknown setting: %s']='Ajuste desconocido: %s'
+  ['Wrong rclone config password (protux keyring set)']='Contraseña de la config de rclone incorrecta (protux keyring set)'
+  ['The mount folder %s does not exist; open Protux to create it']='La carpeta de montaje %s no existe; abre Protux para crearla'
+  ['Cannot create %s. Create it as root: sudo install -d -o %s %s']='No se puede crear %s. Créala como root: sudo install -d -o %s %s'
+  ['Could not create %s']='No se pudo crear %s'
+)

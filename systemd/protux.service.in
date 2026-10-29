@@ -1,0 +1,29 @@
+[Unit]
+Description=Proton Drive mount (protux)
+Documentation=man:protux(1)
+Wants=network-online.target
+After=network-online.target graphical-session.target
+# Every start is a login at Proton, and repeated logins get the account blocked (HTTP 429):
+# give up after 3 attempts per hour and let protux-alert ask the user
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+OnFailure=protux-alert.service
+
+[Service]
+# rclone sends READY=1 once the drive is mounted, so units ordered After= this one
+# see a working mount
+Type=notify
+NotifyAccess=all
+# Waits for the keyring (up to 4 min) and DNS (up to 3 min) before mounting
+TimeoutStartSec=10min
+ExecStart=@BINDIR@/protux __run
+ExecStartPost=-@BINDIR@/protux __post-start
+ExecStopPost=-@BINDIR@/protux __stop-post
+Restart=on-failure
+RestartSec=20s
+# 10 session expired, 11 rate limit, 12 wrong password, 13 mailbox password, 14 CAPTCHA,
+# 15 wrong rclone config password: retrying only makes these worse
+RestartPreventExitStatus=10 11 12 13 14 15
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+Name=Protux
+GenericName=Proton Drive client
+GenericName[es]=Cliente de Proton Drive
+Comment=Mount your Proton Drive as a folder
+Comment[es]=Monta tu Proton Drive como una carpeta
+Exec=@BINDIR@/protux-gui
+Icon=protux
+Terminal=false
+Categories=Network;FileTransfer;Qt;
+Keywords=proton;drive;protondrive;rclone;cloud;mount;sync;nube;
+StartupNotify=true
+Actions=login;preferences;
+
+[Desktop Action login]
+Name=Log in again (2FA)
+Name[es]=Volver a iniciar sesión (2FA)
+Exec=@BINDIR@/protux-gui --login
+
+[Desktop Action preferences]
+Name=Preferences
+Name[es]=Preferencias
+Exec=@BINDIR@/protux-gui --preferences

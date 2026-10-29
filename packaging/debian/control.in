@@ -1,0 +1,20 @@
+Package: protux
+Version: @VERSION@-1
+Architecture: all
+Section: net
+Priority: optional
+Maintainer: FrankMncrf <57369835+FrankMncrf@users.noreply.github.com>
+Depends: bash, rclone, fuse3, systemd, gawk
+Recommends: python3-pyqt6, pkexec | policykit-1, libsecret-tools, libnotify-bin, dbus-user-session
+Suggests: zenity | kdialog
+Homepage: https://github.com/FrankMncrf/Protux
+Description: Proton Drive client for Linux: mount your drive as a folder
+ Protux mounts Proton Drive as a normal folder with rclone and a systemd
+ user service, and keeps it working: setup wizard, system tray icon,
+ 2FA re-login prompts when the session expires, two-password accounts,
+ and no login loops that get the account rate-limited (HTTP 429).
+ .
+ Debian 13 and Ubuntu 24.04 ship an rclone without the Proton Drive
+ backend: install rclone >= 1.64 from rclone.org.
+ .
+ Unofficial; not affiliated with Proton AG.

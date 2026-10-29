@@ -1,0 +1,87 @@
+.TH PROTUX 1 "2026-10-29" "protux 0.1.0" "User Commands"
+.SH NAME
+protux \- Proton Drive for Linux on top of rclone and systemd
+.SH SYNOPSIS
+.B protux
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B protux
+mounts a Proton Drive account with
+.BR rclone (1)
+as a systemd user service and keeps it working: it waits for the keyring and the
+network before logging in, never retries a login that can only fail (expired session
+or Proton rate limit), and asks for a new 2FA code through a desktop notification.
+.SH COMMANDS
+.TP
+.B setup
+Interactive first-time setup: rclone remote, mountpoint, first login, autostart.
+.TP
+.BR login " [" \-\-gui "] [" \-\-no\-2fa ]
+Renew the Proton session with a 2FA code, then mount again.
+.B \-\-gui
+asks in a window (zenity or kdialog).
+.TP
+.B password
+Change the account password or the second (mailbox) password of a two-password account.
+.TP
+.B gui
+Open the graphical app,
+.BR protux-gui :
+setup wizard, status and preferences.
+.TP
+.BR start ", " stop ", " restart
+Mount or unmount the drive through
+.IR protux.service .
+.TP
+.BR enable ", " disable
+Mount automatically when the user session starts.
+.TP
+.B status
+Service, mount, session and cache state.
+.TP
+.BR logs " [" \-f ]
+Service journal.
+.TP
+.B doctor
+Check dependencies and configuration.
+.TP
+.BR keyring " set|check|clear"
+Manage the rclone config password stored in the Secret Service keyring.
+.TP
+.BR config " [show|edit|path]"
+Show, edit or locate the configuration file.
+.SH CONFIGURATION
+.I ~/.config/protux/config
+is a bash file; every setting is optional. See
+.I /usr/share/doc/protux/config.example
+for the full list: REMOTE, MOUNTPOINT, RCLONE, RCLONE_CONFIG, KEYRING, KEYRING_ATTRS,
+CACHE_DIR, VFS_CACHE_MODE, VFS_CACHE_MAX_SIZE, VFS_CACHE_MAX_AGE, VFS_WRITE_BACK,
+DIR_CACHE_TIME, BUFFER_SIZE, UMASK, ALLOW_OTHER, LOG_LEVEL, EXTRA_ARGS, NET_HOST,
+NET_TIMEOUT, KEYRING_TIMEOUT, RETRY_429_AFTER, HOOK_TIMEOUT, GUI_WAIT.
+.SH HOOKS
+Executables in
+.I ~/.config/protux/hooks/post-mount.d/
+run after every successful mount with
+.B PROTUX_MOUNTPOINT
+and
+.B PROTUX_REMOTE
+set. Services that need the drive can instead use
+.B After=protux.service
+and
+.BR BindsTo=protux.service :
+the unit is
+.B Type=notify
+and only becomes active once the drive is mounted.
+.SH EXIT STATUS OF THE SERVICE
+10: the Proton session expired (2FA login needed). 11: Proton is rate-limiting logins
+(HTTP 429). Neither is retried automatically.
+.SH FILES
+.I ~/.local/state/protux/state
+last known session state;
+.I ~/.local/state/protux/last-errors.log
+error lines of the last mount.
+.SH SEE ALSO
+.BR rclone (1),
+.BR systemctl (1),
+.BR secret-tool (1)

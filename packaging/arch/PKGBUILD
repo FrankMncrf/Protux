@@ -1,0 +1,34 @@
+# Maintainer: FrankMncrf <57369835+FrankMncrf@users.noreply.github.com>
+pkgname=protux
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Proton Drive client for Linux: mounts your drive as a folder with rclone + systemd, tray app, setup wizard and 2FA re-login"
+arch=('any')
+url="https://github.com/FrankMncrf/Protux"
+license=('GPL-3.0-or-later')
+depends=('bash' 'rclone' 'fuse3' 'systemd' 'gawk')
+optdepends=('python-pyqt6: tray icon, window, setup wizard and preferences (protux-gui)'
+            'polkit: create the default mount folder /media/ProtonDrive'
+            'libsecret: keep the rclone config password in the keyring (secret-tool)'
+            'libnotify: notifications when the session expires'
+            'zenity: 2FA prompt without the graphical app (GTK)'
+            'kdialog: 2FA prompt without the graphical app (KDE)')
+backup=()
+install=protux.install
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "Protux-$pkgver"
+  make PREFIX=/usr
+}
+
+check() {
+  cd "Protux-$pkgver"
+  bash -n bin/protux lib/protux/common.sh
+}
+
+package() {
+  cd "Protux-$pkgver"
+  make PREFIX=/usr DESTDIR="$pkgdir" install
+}

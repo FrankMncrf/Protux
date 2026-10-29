@@ -1,0 +1,7 @@
+post_install() {
+  echo ">> Run 'protux setup' as your user to configure and mount Proton Drive."
+}
+
+pre_remove() {
+  echo ">> Stop the mount first if it's running: systemctl --user disable --now protux"
+}

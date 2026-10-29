@@ -1,0 +1,751 @@
+#!/usr/bin/env bash
+# protux: Proton Drive for Linux, on top of rclone mount and systemd.
+set -uo pipefail
+
+PTX_SELF=$(readlink -f "$0")
+PTX_LIB=${PROTUX_LIB:-$(dirname "$PTX_SELF")/../lib/protux}
+# shellcheck source=../lib/protux/common.sh
+. "$PTX_LIB/common.sh" || exit 1
+
+ptx_load_config
+
+usage() {
+  [ -n "${PTX_USAGE_ES:-}" ] && { printf '%s' "$PTX_USAGE_ES"; return; }
+  printf '%s' 'Usage: protux <command> [options]
+
+Commands:
+  setup             Interactive first-time setup (rclone remote, mountpoint, service)
+  gui               Open the graphical app (setup wizard and settings)
+  login [--gui]     Renew the Proton session with a 2FA code and mount again
+  password          Change the account password or the second (mailbox) password
+  open              Open the drive in your file manager
+  start | stop | restart
+                    Mount or unmount the drive (through the systemd user service)
+  enable | disable  Mount automatically at login, or stop doing so
+  status            Show service, mount and session state
+  logs [-f]         Show the service log
+  doctor            Check dependencies and configuration
+  keyring set|check|clear
+                    Manage the rclone config password stored in the keyring
+  config [edit|path]
+                    Show, edit or locate the configuration file
+  version           Show the version
+'
+}
+
+systemctl_user() { systemctl --user "$@"; }
+
+# Settings the GUI may read and change
+PTX_SETTINGS=(REMOTE MOUNTPOINT RCLONE RCLONE_CONFIG KEYRING KEYRING_ATTRS CACHE_DIR
+  VFS_CACHE_MODE VFS_CACHE_MAX_SIZE VFS_CACHE_MAX_AGE VFS_WRITE_BACK DIR_CACHE_TIME
+  BUFFER_SIZE UMASK ALLOW_OTHER LOG_LEVEL EXTRA_ARGS NET_HOST NET_TIMEOUT KEYRING_TIMEOUT
+  RETRY_429_AFTER HOOK_TIMEOUT GUI_WAIT FILE_MANAGER)
+
+# ---------------------------------------------------------------- service internals
+
+# ExecStart= of protux.service
+cmd___run() {
+  local i rc cls state msg args
+
+  mkdir -p "$PTX_STATE_DIR" "$CACHE_DIR"
+  : >"$PTX_ERRLOG"
+
+  if ptx_use_keyring; then
+    for ((i = 0; i < KEYRING_TIMEOUT / 2; i++)); do
+      ptx_keyring_lookup >/dev/null 2>&1 && break
+      sleep 2
+    done
+    if ! ptx_keyring_lookup >/dev/null 2>&1; then
+      msg=$(t 'Keyring not available after %s s (or no password stored: protux keyring set)' "$KEYRING_TIMEOUT")
+      ptx_state_set error "$msg"
+      warn "$msg"
+      exit 1
+    fi
+  fi
+
+  # Without network every attempt would be wasted (and count towards the start limit)
+  for ((i = 0; i < NET_TIMEOUT / 2; i++)); do
+    getent hosts "$NET_HOST" >/dev/null && break
+    sleep 2
+  done
+  if ! getent hosts "$NET_HOST" >/dev/null; then
+    msg=$(t 'No DNS for %s after %s s' "$NET_HOST" "$NET_TIMEOUT")
+    ptx_state_set error "$msg"
+    warn "$msg"
+    exit 1
+  fi
+
+  # A previous crash may have left a stale mount behind
+  ptx_fusermount -uz "$MOUNTPOINT" 2>/dev/null
+  # The folder isn't created here: under /media that needs root, and a service can't ask for it
+  if ! [ -d "$MOUNTPOINT" ] && ! mkdir -p "$MOUNTPOINT" 2>/dev/null; then
+    msg=$(t 'The mount folder %s does not exist; open Protux to create it' "$MOUNTPOINT")
+    ptx_state_set error "$msg"
+    warn "$msg"
+    exit 1
+  fi
+
+  args=(mount "$REMOTE:" "$MOUNTPOINT"
+    --vfs-cache-mode="$VFS_CACHE_MODE"
+    --vfs-cache-max-size="$VFS_CACHE_MAX_SIZE"
+    --vfs-cache-max-age="$VFS_CACHE_MAX_AGE"
+    --vfs-write-back="$VFS_WRITE_BACK"
+    --cache-dir="$CACHE_DIR"
+    --dir-cache-time="$DIR_CACHE_TIME"
+    --poll-interval=0
+    --buffer-size="$BUFFER_SIZE"
+    --devname="$REMOTE"
+    --umask="$UMASK"
+    --log-level="$LOG_LEVEL"
+    --protondrive-replace-existing-draft=true)
+  [ "$ALLOW_OTHER" = yes ] && args+=(--allow-other)
+  args+=("${EXTRA_ARGS[@]}")
+
+  # rclone sends READY=1 itself (NotifyAccess=all); its output goes to the journal and the
+  # error lines are kept to explain a failure afterwards
+  ptx_rclone "${args[@]}" 2>&1 |
+    awk -v f="$PTX_ERRLOG" '{ print; fflush() } /ERROR|CRITICAL|Fatal|429|2FA/ { print >> f; fflush(f) }'
+  rc=${PIPESTATUS[0]}
+  ((rc == 0)) && exit 0
+
+  cls=$(ptx_classify "$PTX_ERRLOG")
+  state=${cls%%$'\t'*} msg=${cls#*$'\t'}
+  ptx_state_set "$state" "$msg"
+  [ "$state" = error ] && exit "$rc"
+  exit "$(ptx_state_exit "$state")"
+}
+
+# ExecStartPost=: the drive is mounted (rclone sent READY=1)
+cmd___post_start() {
+  local hook
+  ptx_state_set ok
+  [ -d "$PTX_HOOKS_DIR/post-mount.d" ] || return 0
+  export PROTUX_MOUNTPOINT=$MOUNTPOINT PROTUX_REMOTE=$REMOTE
+  for hook in "$PTX_HOOKS_DIR"/post-mount.d/*; do
+    [ -f "$hook" ] && [ -x "$hook" ] || continue
+    timeout "$HOOK_TIMEOUT" "$hook" || warn 'Hook %s failed (exit %s)' "$hook" "$?"
+  done
+  return 0
+}
+
+# ExecStopPost=
+cmd___stop_post() {
+  ptx_mounted && ptx_fusermount -uz "$MOUNTPOINT"
+  return 0
+}
+
+# --password-command for rclone
+# Make sure the mount folder exists and belongs to the user. A folder in a system location
+# (the default, /media/ProtonDrive) is created once with administrator rights through pkexec.
+cmd___prepare_mountpoint() {
+  local dir=${1:-$MOUNTPOINT}
+  mountpoint -q "$dir" 2>/dev/null && return 0
+  [ -d "$dir" ] && [ -w "$dir" ] && [ -O "$dir" ] && return 0
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null && [ -O "$dir" ] && return 0
+  command -v pkexec >/dev/null || die 'Cannot create %s. Create it as root: sudo install -d -o %s %s' "$dir" "$(id -un)" "$dir"
+  pkexec /usr/bin/install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" "$dir" || die 'Could not create %s' "$dir"
+}
+
+cmd___config_pass() {
+  ptx_keyring_lookup
+}
+
+# protux-alert.service (OnFailure= of the mount): tell the user what happened
+cmd___alert() {
+  ptx_mounted && exit 0
+  ptx_state_get
+  # Schedule the next attempt first: it mustn't depend on someone being logged in now
+  if [ "$PTX_STATE" = ratelimit ]; then
+    systemctl_user stop "$PTX_RETRY_UNIT.timer" 2>/dev/null
+    systemd-run --user --quiet --collect --unit="$PTX_RETRY_UNIT" --on-active="$RETRY_429_AFTER" \
+      "$PTX_SELF" __prompt
+  fi
+  ptx_wait_gui || exit 0
+  case "$PTX_STATE" in
+    auth)
+      prompt_user ask
+      ;;
+    password | mailbox)
+      prompt_user ask-password
+      ;;
+    ratelimit)
+      ptx_notify normal "$(t 'Proton Drive: too many login attempts')" \
+        "$(t 'Proton blocked new logins for a while. I will ask for the 2FA code again in %s.' "$RETRY_429_AFTER")"
+      ;;
+    *)
+      ptx_notify critical "$(t 'Proton Drive could not be mounted')" \
+        "${PTX_STATE_MSG:-$(t 'See: protux logs')}"
+      ;;
+  esac
+}
+
+# The notification waits for a click, so it runs in its own unit (the alert unit is a oneshot
+# and systemd would kill it)
+prompt_user() {
+  ptx_mounted && return
+  systemctl_user is-active -q "$PTX_PROMPT_UNIT.service" && return
+  systemd-run --user --quiet --collect --unit="$PTX_PROMPT_UNIT" \
+    --setenv=DISPLAY="${DISPLAY:-}" --setenv=WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+    --setenv=XAUTHORITY="${XAUTHORITY:-}" --setenv=DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+    --setenv=LANG="${LANG:-}" "$PTX_SELF" "__$1"
+}
+
+cmd___prompt() {
+  ptx_wait_gui || exit 0
+  prompt_user ask
+}
+
+# Critical notification (doesn't time out); the window only opens on click
+ask_click() { # title body button
+  local action
+  ptx_notify_has_actions || return 0
+  action=$(notify-send -a "Protux" -i folder-remote -u critical --wait \
+    -A "default=$3" "$1" "$2")
+  [ "$action" = default ]
+}
+
+cmd___ask() {
+  ptx_mounted && exit 0
+  ask_click "$(t 'Proton Drive: session expired')" "$(t 'Click here to enter your 2FA code.')" \
+    "$(t 'Enter 2FA code')" || exit 0
+  exec "$PTX_SELF" login --gui
+}
+
+cmd___ask_password() {
+  ptx_mounted && exit 0
+  ptx_state_get
+  ask_click "$(t 'Proton Drive could not log in')" "$PTX_STATE_MSG" "$(t 'Fix it')" || exit 0
+  if ptx_has_app; then exec protux-gui --login; fi
+  exec "$PTX_SELF" login --gui
+}
+
+# ---------------------------------------------------------------- GUI interface
+# Small, stable, line-based interface for protux-gui. Secrets only travel through stdin.
+
+# Log in with the code on stdin (may be empty). Exit status: ptx_state_exit; message on stderr.
+cmd___login() {
+  local code out rc cls state msg tmp
+  IFS= read -r code || true
+  code=${code//[[:space:]]/}
+
+  # Nothing else may log in while we do (and the scheduled retry after a 429 is no longer needed)
+  systemctl_user stop "$PTX_UNIT" "$PTX_RETRY_UNIT.timer" 2>/dev/null
+
+  rc=0
+  out=$(RCLONE_PROTONDRIVE_2FA=$code ptx_rclone lsd "$REMOTE:" --low-level-retries=1 --retries=1 2>&1) || rc=$?
+  if ((rc == 0)); then
+    ptx_state_set ok
+    return 0
+  fi
+  tmp=$(mktemp)
+  printf '%s\n' "$out" >"$tmp"
+  cls=$(ptx_classify "$tmp")
+  rm -f "$tmp"
+  state=${cls%%$'\t'*} msg=${cls#*$'\t'}
+  # A wrong 2FA code isn't worth a notification later on
+  [ "$state" != auth ] && ptx_state_set "$state" "$msg"
+  printf '%s\n' "${msg:-$(tail -n 1 <<<"$out")}" >&2
+  exit "$(ptx_state_exit "$state")"
+}
+
+# stdin: username, password, mailbox password (one per line; empty = keep the current value).
+# Creates the remote if it doesn't exist. --clear-mailbox removes the mailbox password.
+cmd___set_credentials() {
+  local user pass mbox args=() exists=0
+  IFS= read -r user || true
+  IFS= read -r pass || true
+  IFS= read -r mbox || true
+
+  ptx_rclone listremotes 2>/dev/null | grep -qx "$REMOTE:" && exists=1
+  if ! ((exists)) && { [ -z "$user" ] || [ -z "$pass" ]; }; then
+    warn 'Email and password are required.'
+    exit 2
+  fi
+
+  [ -n "$user" ] && args+=("username=$user")
+  # Obscured through stdin so the clear password never shows up in the process list
+  [ -n "$pass" ] && args+=("password=$(printf '%s' "$pass" | "$RCLONE" obscure -)")
+  [ -n "$mbox" ] && args+=("mailbox_password=$(printf '%s' "$mbox" | "$RCLONE" obscure -)")
+  [ "${1:-}" = --clear-mailbox ] && args+=("mailbox_password=")
+  ((${#args[@]})) || return 0
+
+  if ((exists)); then
+    # New credentials: forget the old session so the next login uses them
+    args+=(client_uid= client_access_token= client_refresh_token= client_salted_key_pass=)
+    ptx_rclone config update "$REMOTE" "${args[@]}" --no-obscure --non-interactive >/dev/null
+  else
+    ptx_rclone config create "$REMOTE" protondrive "${args[@]}" --no-obscure --non-interactive >/dev/null
+  fi || {
+    warn 'Could not save the credentials in the rclone config.'
+    exit 1
+  }
+}
+
+ptx_username() {
+  ptx_rclone config show "$REMOTE" 2>/dev/null | sed -n 's/^username = //p'
+}
+
+cmd___info() {
+  local exists=0
+  ptx_state_get
+  # --quick: only what changes from one second to the next (no rclone, no keyring), for polling
+  if [ "${1:-}" = --quick ]; then
+    printf '%s=%s\n' \
+      mountpoint "$MOUNTPOINT" \
+      mounted "$(ptx_mounted && echo 1 || echo 0)" \
+      active "$(systemctl_user is-active "$PTX_UNIT" 2>/dev/null)" \
+      enabled "$(systemctl_user is-enabled "$PTX_UNIT" 2>/dev/null)" \
+      state "$PTX_STATE" \
+      state_time "$PTX_STATE_TIME" \
+      state_msg "$PTX_STATE_MSG"
+    return
+  fi
+  ptx_rclone listremotes 2>/dev/null | grep -qx "$REMOTE:" && exists=1
+  printf '%s=%s\n' \
+    version "$PTX_VERSION" \
+    config_file "$PTX_CONFIG_FILE" \
+    config_exists "$([ -r "$PTX_CONFIG_FILE" ] && echo 1 || echo 0)" \
+    remote "$REMOTE" \
+    remote_exists "$exists" \
+    username "$( ((exists)) && ptx_username)" \
+    mailbox "$( ((exists)) && ptx_rclone config show "$REMOTE" 2>/dev/null | grep -q '^mailbox_password = .' && echo 1 || echo 0)" \
+    mountpoint "$MOUNTPOINT" \
+    mounted "$(ptx_mounted && echo 1 || echo 0)" \
+    active "$(systemctl_user is-active "$PTX_UNIT" 2>/dev/null)" \
+    enabled "$(systemctl_user is-enabled "$PTX_UNIT" 2>/dev/null)" \
+    state "$PTX_STATE" \
+    state_time "$PTX_STATE_TIME" \
+    state_msg "$PTX_STATE_MSG" \
+    rclone_version "$("$RCLONE" version 2>/dev/null | sed -n '1s/^rclone //p')" \
+    rclone_protondrive "$("$RCLONE" help backend protondrive >/dev/null 2>&1 && echo 1 || echo 0)" \
+    config_encrypted "$(ptx_config_encrypted && echo 1 || echo 0)" \
+    keyring "$(ptx_use_keyring && echo 1 || echo 0)" \
+    keyring_ok "$(ptx_use_keyring && ptx_keyring_lookup >/dev/null 2>&1 && echo 1 || echo 0)" \
+    fuse "$([ -c /dev/fuse ] && echo 1 || echo 0)" \
+    user_allow_other "$(grep -qs '^[[:space:]]*user_allow_other' /etc/fuse.conf && echo 1 || echo 0)" \
+    cache_size "$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)"
+}
+
+cmd___get_config() {
+  local k
+  for k in "${PTX_SETTINGS[@]}"; do
+    if [ "$k" = EXTRA_ARGS ]; then
+      printf 'EXTRA_ARGS=%s\n' "${EXTRA_ARGS[*]@Q}"
+    else
+      printf '%s=%s\n' "$k" "${!k}"
+    fi
+  done
+}
+
+# __set-config KEY VALUE [KEY VALUE...]: replace or append the setting in the config file
+cmd___set_config() {
+  local k v line tmp
+  mkdir -p "$(dirname "$PTX_CONFIG_FILE")"
+  [ -e "$PTX_CONFIG_FILE" ] || printf '# protux configuration (bash syntax). All settings: man protux\n' >"$PTX_CONFIG_FILE"
+  while (($# >= 2)); do
+    k=$1 v=$2
+    shift 2
+    [[ " ${PTX_SETTINGS[*]} " == *" $k "* ]] || die 'Unknown setting: %s' "$k"
+    if [ "$k" = EXTRA_ARGS ]; then
+      line="EXTRA_ARGS=($v)"
+      bash -n <<<"$line" 2>/dev/null || die 'Invalid value for %s' "$k"
+    else
+      line="$k=${v@Q}"
+    fi
+    tmp=$(mktemp)
+    # The line goes through the environment: awk -v would eat the backslashes of escaped values
+    PTX_LINE=$line awk -v k="$k" '
+      BEGIN { line = ENVIRON["PTX_LINE"] }
+      $0 ~ "^" k "=" { if (!done) print line; done = 1; next }
+      { print }
+      END { if (!done) print line }' "$PTX_CONFIG_FILE" >"$tmp" && cat "$tmp" >"$PTX_CONFIG_FILE"
+    rm -f "$tmp"
+  done
+}
+
+# ---------------------------------------------------------------- dialogs
+
+ask_secret() { # gui prompt-text
+  local c
+  if (($1)); then
+    case "$(ptx_gui_tool)" in
+      zenity) zenity --entry --hide-text --title="Protux" --width=380 \
+        --window-icon=folder-remote --ok-label="$(t 'Log in')" --cancel-label="$(t 'Cancel')" \
+        --text="$2" 2>/dev/null ;;
+      kdialog) kdialog --title "Protux" --password "$2" 2>/dev/null ;;
+      *) return 1 ;;
+    esac
+  else
+    read -rsp "$(printf '%b' "$2") " c
+    echo >&2
+    printf '%s' "$c"
+  fi
+}
+
+show_error() { # gui text
+  if (($1)); then
+    case "$(ptx_gui_tool)" in
+      zenity) zenity --error --title="Protux" --width=380 --text="$2" 2>/dev/null ;;
+      kdialog) kdialog --title "Protux" --error "$2" 2>/dev/null ;;
+    esac
+  else
+    printf '%b\n' "$2" >&2
+  fi
+}
+
+# ---------------------------------------------------------------- user commands
+
+cmd_gui() {
+  ptx_has_app || die 'The graphical app is not installed (protux-gui).'
+  exec protux-gui "$@"
+}
+
+cmd_login() {
+  local gui=0 no2fa=0 hint="" code err rc arg secret progress_pid=
+  for arg; do
+    case "$arg" in
+      --gui) gui=1 ;;
+      --no-2fa) no2fa=1 ;;
+      *) die 'Unknown option: %s' "$arg" ;;
+    esac
+  done
+  if ((gui)); then
+    ptx_has_app && exec protux-gui --login
+    if [ -z "$(ptx_gui_tool)" ]; then
+      ptx_notify critical "Protux" "$(t 'Install zenity or kdialog, or run: protux login')"
+      exit 1
+    fi
+  fi
+
+  while :; do
+    code=
+    if ! ((no2fa)); then
+      code=$(ask_secret "$gui" "$hint$(t 'Your Proton Drive session expired.\nEnter the 6-digit 2FA code:')") || exit 1
+      code=${code//[[:space:]]/}
+      if [[ ! "$code" =~ ^[0-9]{6}$ ]]; then
+        ((gui)) || die 'The code must have 6 digits.'
+        hint="$(t 'The code must have 6 digits.')\n\n"
+        continue
+      fi
+    fi
+
+    ((gui)) || say 'Logging in to Proton Drive...'
+    if ((gui)) && [ "$(ptx_gui_tool)" = zenity ]; then
+      zenity --progress --pulsate --no-cancel --title="Protux" --width=380 \
+        --text="$(t 'Logging in to Proton Drive...')" </dev/zero 2>/dev/null &
+      progress_pid=$!
+    fi
+    rc=0
+    err=$(printf '%s\n' "$code" | cmd___login 2>&1 >/dev/null) || rc=$?
+    [ -n "$progress_pid" ] && kill "$progress_pid" 2>/dev/null
+    progress_pid=
+    hint=
+
+    case "$rc" in
+      0) break ;;
+      13 | 12)
+        # Ask for the missing/wrong password and try again
+        if ((rc == 13)); then
+          secret=$(ask_secret "$gui" "$err\n\n$(t 'Second (mailbox) password:')") || exit 1
+          printf '\n\n%s\n' "$secret" | cmd___set_credentials || exit 1
+        else
+          secret=$(ask_secret "$gui" "$err\n\n$(t 'Proton password:')") || exit 1
+          printf '\n%s\n\n' "$secret" | cmd___set_credentials || exit 1
+        fi
+        unset secret
+        ;;
+      10)
+        ((gui)) || die '%s' "$err"
+        # A mistyped or expired code shouldn't make the user start over
+        hint="$(t 'Could not log in'): $err\n$(t 'Check the code and try again.')\n\n"
+        ;;
+      11)
+        show_error "$gui" "$(t 'Proton is still limiting login attempts (429). Wait a few minutes and try again.')"
+        exit 1
+        ;;
+      *)
+        show_error "$gui" "$err"
+        exit 1
+        ;;
+    esac
+  done
+
+  if ((gui)); then
+    ptx_notify normal "Protux" "$(t 'Session renewed. Mounting the drive...')"
+  else
+    say 'Session renewed.'
+  fi
+
+  systemctl_user reset-failed "$PTX_UNIT" 2>/dev/null
+  if [ "$(systemctl_user is-enabled "$PTX_UNIT" 2>/dev/null)" = disabled ] && [ -r "$PTX_STATE_DIR/enabled" ]; then
+    systemctl_user enable "$PTX_UNIT" 2>/dev/null
+  fi
+  wait_mount || {
+    show_error "$gui" "$(t 'Proton Drive did not mount. See: protux logs')"
+    exit 1
+  }
+  if ((gui)); then
+    ptx_notify normal "Protux" "$(t 'Proton Drive mounted at %s' "$MOUNTPOINT")"
+  else
+    say 'Proton Drive mounted at %s' "$MOUNTPOINT"
+  fi
+}
+
+cmd_password() {
+  local pass mbox ans
+  [ -t 0 ] || die 'This command is interactive; run it in a terminal.'
+  read -rsp "$(t 'New Proton password (empty = keep): ')" pass
+  echo
+  read -rp "$(t 'Does your account use a second (mailbox) password? [y/N] ')" ans
+  if [[ "$ans" =~ ^[yYsS] ]]; then
+    read -rsp "$(t 'Second (mailbox) password (empty = keep): ')" mbox
+    echo
+    printf '\n%s\n%s\n' "$pass" "$mbox" | cmd___set_credentials || exit 1
+  else
+    printf '\n%s\n\n' "$pass" | cmd___set_credentials --clear-mailbox || exit 1
+  fi
+  say 'Saved. Run protux login to log in with them.'
+}
+
+wait_mount() {
+  local i
+  systemctl_user start --no-block "$PTX_UNIT"
+  for ((i = 0; i < 60; i++)); do
+    ptx_mounted && return 0
+    systemctl_user is-failed -q "$PTX_UNIT" && return 1
+    sleep 2
+  done
+  return 1
+}
+
+cmd_start() {
+  ptx_mounted && { say 'Already mounted at %s' "$MOUNTPOINT"; return 0; }
+  systemctl_user reset-failed "$PTX_UNIT" 2>/dev/null
+  say 'Mounting %s at %s...' "$REMOTE:" "$MOUNTPOINT"
+  if wait_mount; then
+    say 'Mounted.'
+  else
+    ptx_state_get
+    [ "$PTX_STATE" = auth ] && die 'The Proton session expired. Run: protux login'
+    die '%s' "${PTX_STATE_MSG:-$(t 'Could not mount. See: protux logs')}"
+  fi
+}
+
+# Open the drive in the user's own file manager. Not the GIO/xdg-mime default for folders:
+# that is often a file manager pulled in as a dependency (Nautilus via xdg-desktop-portal-gnome
+# on an XFCE desktop, for instance), not the one the desktop is configured to use
+cmd_open() {
+  local dir=${1:-$MOUNTPOINT}
+  if [ -n "$FILE_MANAGER" ]; then
+    # shellcheck disable=SC2086  # FILE_MANAGER may carry options
+    setsid -f $FILE_MANAGER "$dir" >/dev/null 2>&1
+    return
+  fi
+  case ":${XDG_CURRENT_DESKTOP:-}:" in
+    *:XFCE:*)
+      if command -v exo-open >/dev/null; then
+        setsid -f exo-open --launch FileManager "$dir" >/dev/null 2>&1
+        return
+      fi
+      ;;
+  esac
+  # xdg-open asks the running desktop (KDE, GNOME, MATE, Cinnamon, LXQt...) for its own choice
+  if command -v xdg-open >/dev/null; then setsid -f xdg-open "$dir" >/dev/null 2>&1
+  else setsid -f gio open "$dir" >/dev/null 2>&1; fi
+}
+
+cmd_stop() { systemctl_user stop "$PTX_UNIT"; }
+cmd_restart() { cmd_stop; cmd_start; }
+
+cmd_enable() {
+  systemctl_user enable "$PTX_UNIT" && mkdir -p "$PTX_STATE_DIR" && touch "$PTX_STATE_DIR/enabled"
+}
+
+cmd_disable() {
+  systemctl_user disable "$PTX_UNIT" && rm -f "$PTX_STATE_DIR/enabled"
+}
+
+cmd_logs() { journalctl --user -u "$PTX_UNIT" -u protux-alert.service --no-pager -n 100 "$@"; }
+
+# label value...: aligned by characters (printf pads by bytes, which breaks "Caché:")
+row() {
+  local l=$1
+  shift
+  printf '%s%*s %s\n' "$l" $((10 - ${#l})) '' "$*"
+}
+
+cmd_status() {
+  local active enabled
+  active=$(systemctl_user is-active "$PTX_UNIT" 2>/dev/null)
+  enabled=$(systemctl_user is-enabled "$PTX_UNIT" 2>/dev/null)
+  ptx_state_get
+  ptx_mounted && [ "$PTX_STATE" = unknown ] && PTX_STATE=ok
+
+  row "$(t 'Service:')" "$active (${enabled:-?})"
+  if ptx_mounted; then
+    row "$(t 'Mount:')" "$MOUNTPOINT" "$(t '(mounted)')"
+  else
+    row "$(t 'Mount:')" "$MOUNTPOINT" "$(t '(not mounted)')"
+  fi
+  case "$PTX_STATE" in
+    ok) row "$(t 'Session:')" "$(t 'ok')" ;;
+    auth) row "$(t 'Session:')" "$(t 'expired, run: protux login')" ;;
+    ratelimit) row "$(t 'Session:')" "$(t 'rate-limited by Proton since %s' "$(date -d "@$PTX_STATE_TIME" '+%H:%M')")" ;;
+    unknown) row "$(t 'Session:')" "$(t 'unknown')" ;;
+    *) row "$(t 'Error:')" "$PTX_STATE_MSG" ;;
+  esac
+  row "$(t 'Remote:')" "$REMOTE: ($("$RCLONE" version 2>/dev/null | head -n 1))"
+  [ -d "$CACHE_DIR" ] && row "$(t 'Cache:')" "$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1) $CACHE_DIR"
+}
+
+cmd_doctor() {
+  local bad=0 v
+  ok() { printf '  \e[32m✓\e[0m %s\n' "$(t "$@")"; }
+  ko() { printf '  \e[31m✗\e[0m %s\n' "$(t "$@")"; bad=1; }
+  meh() { printf '  \e[33m!\e[0m %s\n' "$(t "$@")"; }
+
+  if command -v "$RCLONE" >/dev/null; then
+    v=$("$RCLONE" version 2>/dev/null | head -n 1)
+    if "$RCLONE" help backend protondrive >/dev/null 2>&1; then ok 'rclone: %s' "$v"
+    else ko 'rclone %s has no protondrive backend (needs 1.64 or newer)' "$v"; fi
+  else
+    ko 'rclone not found (%s)' "$RCLONE"
+  fi
+  if command -v fusermount3 >/dev/null || command -v fusermount >/dev/null; then ok 'FUSE tools found'
+  else ko 'fusermount3 not found (install fuse3)'; fi
+  [ -c /dev/fuse ] && ok '/dev/fuse available' || ko '/dev/fuse missing (modprobe fuse)'
+  if [ "$ALLOW_OTHER" = yes ]; then
+    grep -q '^[[:space:]]*user_allow_other' /etc/fuse.conf 2>/dev/null && ok 'user_allow_other enabled in /etc/fuse.conf' \
+      || ko 'ALLOW_OTHER=yes needs user_allow_other in /etc/fuse.conf'
+  fi
+
+  [ -r "$PTX_CONFIG_FILE" ] && ok 'Config: %s' "$PTX_CONFIG_FILE" || meh 'No config file, using defaults (protux setup)'
+  if [ -r "$RCLONE_CONFIG" ]; then
+    ok 'rclone config: %s' "$RCLONE_CONFIG"
+    if ptx_config_encrypted; then
+      if ! command -v secret-tool >/dev/null; then ko 'rclone config is encrypted but secret-tool is missing (install libsecret)'
+      elif ptx_keyring_lookup >/dev/null 2>&1; then ok 'Config password found in the keyring'
+      else ko 'Config password not in the keyring (protux keyring set)'; fi
+    fi
+    if ptx_rclone listremotes 2>/dev/null | grep -qx "$REMOTE:"; then ok 'Remote %s found' "$REMOTE:"
+    else ko 'Remote %s not found in the rclone config (protux setup)' "$REMOTE:"; fi
+  else
+    ko 'rclone config not found: %s' "$RCLONE_CONFIG"
+  fi
+
+  if ptx_mounted; then ok 'Mounted at %s' "$MOUNTPOINT"
+  elif [ -d "$MOUNTPOINT" ] && [ -n "$(ls -A "$MOUNTPOINT" 2>/dev/null)" ]; then
+    ko 'Mountpoint %s is not empty' "$MOUNTPOINT"
+  else meh 'Not mounted (%s)' "$MOUNTPOINT"; fi
+
+  command -v notify-send >/dev/null && ok 'notify-send found' || meh 'notify-send missing: no desktop notifications (libnotify)'
+  if ptx_has_app; then ok 'Graphical app installed (protux-gui)'
+  elif [ -n "$(ptx_gui_tool)" ]; then ok '2FA dialog: %s' "$(ptx_gui_tool)"
+  else meh 'zenity/kdialog missing: the 2FA code can only be entered in a terminal'; fi
+  [ "$(systemctl_user is-enabled "$PTX_UNIT" 2>/dev/null)" = enabled ] && ok 'Service enabled at login' || meh 'Service not enabled (protux enable)'
+  return "$bad"
+}
+
+cmd_keyring() {
+  command -v secret-tool >/dev/null || die 'secret-tool not found (install libsecret)'
+  case "${1:-check}" in
+    set)
+      say 'Enter the password that encrypts your rclone config:'
+      # shellcheck disable=SC2086
+      secret-tool store --label="protux: rclone config password" $KEYRING_ATTRS
+      ;;
+    check)
+      if ptx_keyring_lookup >/dev/null 2>&1; then say 'Password found in the keyring.'
+      else die 'No password in the keyring (or the keyring is locked).'; fi
+      ;;
+    clear)
+      # shellcheck disable=SC2086
+      secret-tool clear $KEYRING_ATTRS
+      ;;
+    *) die 'Usage: protux keyring set|check|clear' ;;
+  esac
+}
+
+cmd_config() {
+  case "${1:-show}" in
+    path) echo "$PTX_CONFIG_FILE" ;;
+    edit)
+      [ -e "$PTX_CONFIG_FILE" ] || write_config
+      "${VISUAL:-${EDITOR:-nano}}" "$PTX_CONFIG_FILE"
+      ;;
+    show)
+      if [ -r "$PTX_CONFIG_FILE" ]; then cat "$PTX_CONFIG_FILE"
+      else say 'No config file yet (%s); defaults are in use.' "$PTX_CONFIG_FILE"; fi
+      ;;
+    *) die 'Usage: protux config [show|edit|path]' ;;
+  esac
+}
+
+write_config() {
+  cmd___set_config REMOTE "$REMOTE" MOUNTPOINT "$MOUNTPOINT" RCLONE "$RCLONE" RCLONE_CONFIG "$RCLONE_CONFIG"
+}
+
+cmd_setup() {
+  local user pass mbox ans
+  [ -t 0 ] || die 'setup is interactive; run it in a terminal.'
+  say 'protux setup'
+  echo
+
+  read -rp "$(t 'rclone remote name [%s]: ' "$REMOTE")" ans
+  REMOTE=${ans:-$REMOTE}
+  read -rp "$(t 'Mountpoint [%s]: ' "$MOUNTPOINT")" ans
+  MOUNTPOINT=${ans:-$MOUNTPOINT}
+  MOUNTPOINT=${MOUNTPOINT/#\~/$HOME}
+
+  if ptx_config_encrypted && ptx_use_keyring && ! ptx_keyring_lookup >/dev/null 2>&1; then
+    say 'Your rclone config is encrypted; its password will be stored in the keyring.'
+    cmd_keyring set || die 'Could not store the password.'
+  fi
+
+  if ptx_rclone listremotes 2>/dev/null | grep -qx "$REMOTE:"; then
+    say 'Remote %s already exists; keeping it.' "$REMOTE:"
+  else
+    read -rp "$(t 'Proton account (email): ')" user
+    read -rsp "$(t 'Proton password: ')" pass
+    echo
+    read -rp "$(t 'Does your account use a second (mailbox) password? [y/N] ')" ans
+    mbox=
+    if [[ "$ans" =~ ^[yYsS] ]]; then
+      read -rsp "$(t 'Second (mailbox) password: ')" mbox
+      echo
+    fi
+    printf '%s\n%s\n%s\n' "$user" "$pass" "$mbox" | cmd___set_credentials || die 'Could not create the rclone remote.'
+    unset pass mbox
+    say 'Remote %s created.' "$REMOTE:"
+  fi
+
+  write_config
+  say 'Configuration saved to %s' "$PTX_CONFIG_FILE"
+  cmd___prepare_mountpoint "$MOUNTPOINT" || exit 1
+
+  read -rp "$(t 'Does your Proton account use 2FA? [Y/n] ')" ans
+  if [[ "$ans" =~ ^[nN] ]]; then cmd_login --no-2fa; else cmd_login; fi || exit 1
+
+  read -rp "$(t 'Mount automatically at login? [Y/n] ')" ans
+  [[ "$ans" =~ ^[nN] ]] || cmd_enable
+  echo
+  say 'Done. Your files are in %s' "$MOUNTPOINT"
+}
+
+# ---------------------------------------------------------------- dispatch
+
+cmd=${1:-help}
+shift 2>/dev/null
+case "$cmd" in
+  setup | gui | login | password | open | start | stop | restart | enable | disable | status | logs | doctor | keyring | config)
+    "cmd_$cmd" "$@" ;;
+  mount) cmd_start "$@" ;;
+  unmount | umount) cmd_stop "$@" ;;
+  __run | __post-start | __stop-post | __config-pass | __alert | __prompt | __ask | __ask-password | \
+    __login | __set-credentials | __info | __get-config | __set-config | __prepare-mountpoint)
+    fn=${cmd//-/_}
+    "cmd_$fn" "$@" ;;
+  version | --version | -V) echo "protux $PTX_VERSION" ;;
+  help | --help | -h) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

@@ -1,0 +1,70 @@
+#!/bin/bash
+# Fake Proton Drive account for tests. Config handling (create, update, obscure...) is done by the
+# real rclone; logins and mounts are simulated with the messages rclone really prints.
+#   password "pass-ok", mailbox password "mbox-ok", 2FA code 123456
+# Control file $FAKE_DRIVE/.force: "429" = rate limited, "captcha" = human verification.
+REAL=${REAL_RCLONE:-/usr/bin/rclone}
+FAKE_DRIVE=${FAKE_DRIVE:-$HOME/.fake-drive}
+mkdir -p "$FAKE_DRIVE"
+
+args=("$@") cfg="" sub="" remote=""
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[i]}" in
+    --config) cfg=${args[i + 1]} ;;
+    --config=*) cfg=${args[i]#--config=} ;;
+  esac
+done
+for a in "$@"; do
+  case "$a" in
+    lsd | mount) sub=$a; break ;;
+    config | obscure | reveal | listremotes | version | help) exec "$REAL" "$@" ;;
+  esac
+done
+[ -n "$sub" ] || exec "$REAL" "$@"
+for a in "$@"; do [[ "$a" == *: && "$a" != -* ]] && { remote=${a%:}; break; }; done
+
+log() { echo "$(date '+%Y/%m/%d %H:%M:%S') $*" >&2; }
+val() {
+  awk -v s="[$remote]" -v k="$1" '$0 == s {f = 1; next} /^\[/ {f = 0}
+    f && $1 == k {sub(/^[^=]*= ?/, ""); print}' "$cfg"
+}
+reveal() { [ -n "$1" ] && "$REAL" reveal "$1"; }
+
+login() {
+  case "$(cat "$FAKE_DRIVE/.force" 2>/dev/null)" in
+    429) log 'ERROR : 429 Too Many Requests: Too many recent logins (Code=2028, Status=429)'; return 1 ;;
+    captcha) log 'ERROR : Human verification required (Code=9001, Status=422)'; return 1 ;;
+  esac
+  [ -n "$(val client_uid)" ] && return 0 # saved session still valid
+  if [ "$(reveal "$(val password)")" != pass-ok ]; then
+    log 'CRITICAL: Failed to create file system: Incorrect login credentials. Please try again. (Code=8002, Status=422)'
+    return 1
+  fi
+  if [ -z "${RCLONE_PROTONDRIVE_2FA:-}" ]; then
+    log "CRITICAL: Failed to create file system for \"$remote:\": couldn't initialize a new proton drive instance: this account requires a 2FA code. Can be provided with --protondrive-2fa=000000"
+    return 1
+  fi
+  if [ "$RCLONE_PROTONDRIVE_2FA" != 123456 ]; then
+    log 'CRITICAL: Failed to create file system: Incorrect code. Please try again. (Code=8002, Status=422)'
+    return 1
+  fi
+  if [ -z "$(val mailbox_password)" ]; then
+    log "CRITICAL: Failed to create file system for \"$remote:\": this account requires a mailbox password"
+    return 1
+  fi
+  if [ "$(reveal "$(val mailbox_password)")" != mbox-ok ]; then
+    log "CRITICAL: Failed to create file system: couldn't decrypt mailbox password: gopenpgp: wrong password in symmetric decryption"
+    return 1
+  fi
+  "$REAL" --config "$cfg" config update "$remote" client_uid=fake-session --non-interactive >/dev/null
+}
+
+login || exit 1
+case "$sub" in
+  lsd) echo "          -1 2026-10-28 12:00:00        -1 Documents" ;;
+  mount)
+    out=()
+    for a in "$@"; do [ "$a" = "$remote:" ] && out+=("$FAKE_DRIVE") || out+=("$a"); done
+    exec "$REAL" "${out[@]}"
+    ;;
+esac

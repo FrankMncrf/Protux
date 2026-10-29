@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <!-- protux: a folder with a cloud. Purple tones in the spirit of Proton's palette, own shape. -->
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9C84FF"/>
+      <stop offset="1" stop-color="#5B3BE8"/>
+    </linearGradient>
+    <linearGradient id="tab" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7E63F2"/>
+      <stop offset="1" stop-color="#4A2FC4"/>
+    </linearGradient>
+  </defs>
+  <path d="M6 15a5 5 0 0 1 5-5h12.5a4 4 0 0 1 3.2 1.6L29.5 15H53a5 5 0 0 1 5 5v4H6z" fill="url(#tab)"/>
+  <rect x="6" y="19" width="52" height="37" rx="6" fill="url(#body)"/>
+  <path d="M23.5 47.5h17.2a7.3 7.3 0 0 0 1-14.5 9.5 9.5 0 0 0-18.1 2.6 6 6 0 0 0-0.1 11.9z" fill="#fff"/>
+</svg>

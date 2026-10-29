@@ -1,0 +1,7 @@
+#!/bin/sh
+# Example post-mount hook. Copy to ~/.config/protux/hooks/post-mount.d/ and chmod +x.
+# Runs every time the drive is mounted, with PROTUX_MOUNTPOINT and PROTUX_REMOTE set.
+# For long-running things prefer a systemd user unit with After=/BindsTo=protux.service.
+
+# docker compose -f "$HOME/my-app/docker-compose.yml" up -d
+notify-send "Proton Drive" "Mounted at $PROTUX_MOUNTPOINT"

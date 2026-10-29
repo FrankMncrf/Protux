@@ -1,0 +1,9 @@
+[Unit]
+Description=Tell the user why the Proton Drive mount failed (protux)
+Documentation=man:protux(1)
+
+[Service]
+Type=oneshot
+# May wait up to 1 h for a desktop session (lingering starts units before login)
+TimeoutStartSec=70min
+ExecStart=@BINDIR@/protux __alert

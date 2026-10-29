@@ -1,0 +1,34 @@
+name: Bug report / Reportar un error
+description: Something does not work as expected / Algo no funciona como debería
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste passwords, 2FA codes, your rclone.conf or your Proton email.**
+        *No pegues contraseñas, códigos 2FA, tu rclone.conf ni tu correo de Proton.*
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened? / ¿Qué pasó?
+      description: What you did, what you expected and what happened / Qué hiciste, qué esperabas y qué ocurrió
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce / Pasos para reproducirlo
+  - type: textarea
+    id: doctor
+    attributes:
+      label: protux doctor
+      description: Output of `protux doctor` and `protux logs` (check it has no personal data) / Salida de `protux doctor` y `protux logs` (revisa que no tenga datos personales)
+      render: text
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment / Entorno
+      description: Help → Copy system information / Ayuda → Copiar información del sistema
+      render: text
+    validations:
+      required: true

@@ -1,0 +1,13 @@
+#!/bin/bash
+# ssh into a running test VM:  tests/vm/vmssh <arch|debian|ubuntu|fedora> [command...]
+# Copy files:                  tests/vm/vmssh <distro> --put <file...> <remote-dir>
+#                              tests/vm/vmssh <distro> --get <remote-glob> <local-dir>
+VMDIR=${VMDIR:-$HOME/.cache/protux-vm}
+case "$1" in arch) P=2231 ;; debian) P=2232 ;; ubuntu) P=2233 ;; fedora) P=2234 ;; *) echo "distro?" >&2; exit 2 ;; esac
+shift
+O=(-i "$VMDIR/key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+case "${1:-}" in
+  --put) shift; exec scp -q "${O[@]}" -P "$P" "${@:1:$#-1}" "tester@127.0.0.1:${!#}" ;;
+  --get) exec scp -q "${O[@]}" -P "$P" "tester@127.0.0.1:$2" "$3" ;;
+  *) exec ssh "${O[@]}" -p "$P" tester@127.0.0.1 "$@" ;;
+esac

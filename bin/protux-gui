@@ -1,0 +1,1559 @@
+#!/usr/bin/env python3
+"""protux — Proton Drive for Linux: tray icon, window, setup wizard and preferences (PyQt6).
+
+All the work is done by the `protux` command; this is only its face. Secrets are handed to
+it through stdin, never as arguments.
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+from PyQt6.QtCore import (QEventLoop, QLibraryInfo, QLocale, QObject, QPointF, QProcess, QRectF, Qt, QTimer,
+                          QTranslator, QUrl, pyqtSignal)
+from PyQt6.QtGui import (QAction, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QKeySequence,
+                         QLinearGradient, QPainter, QPainterPath, QPen, QPixmap)
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+from PyQt6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
+    QSystemTrayIcon, QTabWidget, QTextBrowser, QVBoxLayout, QWidget, QWizard, QWizardPage,
+)
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+LIB = os.environ.get("PROTUX_LIB") or os.path.normpath(os.path.join(HERE, "..", "lib", "protux"))
+CLI = os.environ.get("PROTUX_CLI") or (os.path.join(HERE, "protux")
+                                           if os.path.exists(os.path.join(HERE, "protux")) else "protux")
+
+# ---------------------------------------------------------------------------
+# translations: the source language is English; i18n/<lang>.json maps its strings to other
+# languages. The language follows the session (LC_ALL / LC_MESSAGES / LANG).
+# ---------------------------------------------------------------------------
+
+UI_LANG = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "en")[:2]
+_CATALOG = {}
+try:
+    with open(os.path.join(LIB, "i18n", f"{UI_LANG}.json"), encoding="utf-8") as _f:
+        _CATALOG = json.load(_f)
+except (OSError, ValueError):
+    pass
+
+
+def tr(text):
+    return _CATALOG.get(text, text)
+
+
+APP = "Protux"
+POLL_MS = 4000
+COLORS = {"up": ("#9C84FF", "#5B3BE8"), "connecting": ("#F2C14E", "#C98A12"),
+          "down": ("#A3ABB5", "#6B737D"), "error": ("#F26D6D", "#C42B2B")}
+SETTINGS_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                             "protux", "gui.json")
+AUTOSTART_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                              "autostart", "io.github.frankmncrf.protux.desktop")
+
+# ---------------------------------------------------------------------------
+# icons: a folder with a cloud (data/protux.svg), colored by state like SwanGUI's shield
+# ---------------------------------------------------------------------------
+
+
+def _outline_color():
+    app = QGuiApplication.instance()
+    dark = app is not None and app.palette().window().color().lightness() < 128
+    return "#e6edf3" if dark else "#1b1f24"
+
+
+def _cloud(s):
+    c = QPainterPath()
+    c.moveTo(23.5 * s, 47.5 * s)
+    c.lineTo(40.7 * s, 47.5 * s)
+    c.cubicTo(45 * s, 47.5 * s, 48 * s, 44.2 * s, 48 * s, 40.2 * s)
+    c.cubicTo(48 * s, 36.5 * s, 45.3 * s, 33.5 * s, 41.7 * s, 33 * s)
+    c.cubicTo(40.4 * s, 28.4 * s, 36.4 * s, 25 * s, 32.4 * s, 25 * s)
+    c.cubicTo(27.6 * s, 25 * s, 24 * s, 29.2 * s, 23.6 * s, 35.6 * s)
+    c.cubicTo(20.3 * s, 35.6 * s, 17.5 * s, 38.3 * s, 17.5 * s, 41.6 * s)
+    c.cubicTo(17.5 * s, 44.9 * s, 20.2 * s, 47.5 * s, 23.5 * s, 47.5 * s)
+    c.closeSubpath()
+    return c
+
+
+def drive_icon(state="up", size=64, dim=False, outline=False):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    s = size / 64
+    light, dark = (QColor(c) for c in COLORS[state])
+    if dim:
+        light, dark = light.lighter(130), dark.lighter(130)
+    tab = QPainterPath()
+    tab.addRoundedRect(QRectF(6 * s, 10 * s, 52 * s, 16 * s), 5 * s, 5 * s)
+    notch = QPainterPath()
+    notch.moveTo(29.5 * s, 15 * s)
+    notch.lineTo(60 * s, 15 * s)
+    notch.lineTo(60 * s, 5 * s)
+    notch.lineTo(25 * s, 5 * s)
+    notch.closeSubpath()
+    tab = tab.subtracted(notch)
+    back = QPainterPath()
+    back.addRoundedRect(QRectF(6 * s, 13 * s, 52 * s, 12 * s), 5 * s, 5 * s)
+    body = QPainterPath()
+    body.addRoundedRect(QRectF(6 * s, 19 * s, 52 * s, 37 * s), 6 * s, 6 * s)
+    if outline:
+        p.setPen(QPen(QColor(_outline_color()), 2 * s))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(tab.united(back).united(body))
+    g = QLinearGradient(QPointF(6 * s, 10 * s), QPointF(58 * s, 56 * s))
+    g.setColorAt(0, light.darker(118))
+    g.setColorAt(1, dark.darker(125))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(g)
+    p.drawPath(tab.united(back))
+    g = QLinearGradient(QPointF(6 * s, 19 * s), QPointF(58 * s, 56 * s))
+    g.setColorAt(0, light)
+    g.setColorAt(1, dark)
+    p.setBrush(g)
+    p.drawPath(body)
+    white = QColor("white")
+    if state == "up":
+        p.setBrush(white)
+        p.drawPath(_cloud(s))
+    elif state == "connecting":
+        p.setBrush(white)
+        for x in (22, 32, 42):
+            p.drawEllipse(QPointF(x * s, 37 * s), 3.2 * s, 3.2 * s)
+    elif state == "error":
+        p.setPen(QPen(white, 5 * s, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(QPointF(32 * s, 27 * s), QPointF(32 * s, 39 * s))
+        p.drawPoint(QPointF(32 * s, 47 * s))
+    else:
+        p.setPen(QPen(white, 2.6 * s))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(_cloud(s))
+    p.end()
+    return pm
+
+
+def drive_qicon(state="up", outline=False):
+    icon = QIcon()
+    for size in (16, 22, 24, 32, 48, 64, 128):
+        icon.addPixmap(drive_icon(state, size, outline=outline and size <= 32))
+    return icon
+
+
+def dot_icon(state):
+    pm = QPixmap(14, 14)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(COLORS[state][1]))
+    p.drawEllipse(1, 1, 12, 12)
+    p.end()
+    icon = QIcon(pm)
+    icon.addPixmap(pm, QIcon.Mode.Disabled)  # the tray menu's status line is disabled: keep its color
+    return icon
+
+
+# ---------------------------------------------------------------------------
+# the protux command
+# ---------------------------------------------------------------------------
+
+# Exit codes of `protux __login` (ptx_state_exit)
+EX_OK, EX_AUTH, EX_RATELIMIT, EX_PASSWORD, EX_MAILBOX, EX_CAPTCHA, EX_CONFIG = 0, 10, 11, 12, 13, 14, 15
+
+
+def parse_kv(text):
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def cli(args, stdin=None, timeout=60):
+    try:
+        p = subprocess.run([CLI, *args], input=stdin, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", str(e)
+    return p.returncode, p.stdout, p.stderr.strip()
+
+
+class Runner(QObject):
+    """Runs protux asynchronously; done(rc, out, err) is called in the GUI thread."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.procs = set()
+
+    def run(self, args, done=None, stdin=None):
+        proc = QProcess(self)
+        self.procs.add(proc)
+
+        def finished(code, _status):
+            self.procs.discard(proc)
+            out = bytes(proc.readAllStandardOutput()).decode(errors="replace")
+            err = bytes(proc.readAllStandardError()).decode(errors="replace").strip()
+            proc.deleteLater()
+            if done:
+                done(code, out, err)
+
+        def failed(e):
+            if e == QProcess.ProcessError.FailedToStart and done:
+                done(127, "", tr("Cannot run protux"))
+
+        proc.finished.connect(finished)
+        proc.errorOccurred.connect(failed)
+        proc.start(CLI, args)
+        if stdin is not None:
+            proc.write(stdin.encode())
+        proc.closeWriteChannel()
+        return proc
+
+    def shutdown(self):
+        """Before quitting: a QProcess destroyed while running waits for it and then calls back
+        into Python that is already shutting down, which aborts the interpreter."""
+        for proc in list(self.procs):
+            for sig in (proc.finished, proc.errorOccurred):
+                try:
+                    sig.disconnect()
+                except TypeError:
+                    pass
+            proc.kill()
+            proc.waitForFinished(1000)
+        self.procs.clear()
+
+    def wait(self, args, stdin=None):
+        """Like run(), but returns (rc, out, err) while the GUI keeps repainting."""
+        loop, res = QEventLoop(), []
+        self.run(args, lambda *r: (res.extend(r), loop.quit()), stdin)
+        if not res:
+            loop.exec()
+        return tuple(res)
+
+
+def login_error(rc, err):
+    return {EX_AUTH: tr("The 2FA code is wrong or expired."),
+            EX_PASSWORD: tr("Proton rejected the password."),
+            EX_MAILBOX: tr("This account needs its second (mailbox) password."),
+            EX_RATELIMIT: tr("Proton is limiting login attempts. Wait about an hour before trying again."),
+            EX_CAPTCHA: tr("Proton asks for a human verification. Log in once at proton.me from this network, "
+                           "then try again."),
+            EX_CONFIG: tr("Wrong password for the rclone config file (protux keyring set).")
+            }.get(rc, err or tr("Unknown error"))
+
+
+STATE_LABELS = {"up": tr("Connected"), "connecting": tr("Connecting…"), "down": tr("Not connected"),
+                "error": tr("Needs attention")}
+SESSION_LABELS = {"ok": tr("Active"), "auth": tr("Expired: log in again"),
+                  "ratelimit": tr("Proton is limiting logins"), "password": tr("Password rejected"),
+                  "mailbox": tr("Second password needed"), "captcha": tr("Human verification required"),
+                  "config": tr("Wrong rclone config password")}
+STATE_HINTS = {"auth": tr("The Proton session expired. Log in again with your 2FA code."),
+               "ratelimit": tr("Proton is limiting logins for a while; you will be asked again later."),
+               "password": tr("Proton rejected the password. Update it in Preferences → Account."),
+               "mailbox": tr("This account needs its second (mailbox) password."),
+               "captcha": tr("Proton asks for a human verification. Log in once at proton.me from this network."),
+               "config": tr("The password of the rclone config file is wrong (protux keyring set).")}
+
+
+def drive_state(info, busy=False):
+    if info.get("mounted") == "1":
+        return "up"
+    if busy or info.get("active") in ("activating", "deactivating", "reloading"):
+        return "connecting"
+    if info.get("state") not in (None, "", "ok", "unknown"):
+        return "error"
+    return "down"
+
+
+def open_folder(path):
+    # `protux open` uses the desktop's own file manager (Thunar, Dolphin, Files...), not the
+    # default application for folders, which may be one the user never chose
+    QProcess.startDetached(CLI, ["open", path])
+
+
+def open_url(url):
+    QDesktopServices.openUrl(QUrl(url))
+
+
+# ---------------------------------------------------------------------------
+# small widgets and settings
+# ---------------------------------------------------------------------------
+
+class Settings:
+    """Settings of the window and the tray icon (the drive's own are in ~/.config/protux/config)."""
+
+    def __init__(self):
+        self.data = {"notifications": True, "start_hidden": True, "check_updates": True}
+        try:
+            with open(SETTINGS_PATH, encoding="utf-8") as f:
+                self.data.update(json.load(f))
+        except (OSError, ValueError):
+            pass
+
+    def save(self):
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        tmp = SETTINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, indent=2)
+        os.replace(tmp, SETTINGS_PATH)
+
+    @property
+    def autostart(self):
+        return os.path.exists(AUTOSTART_PATH)
+
+    @autostart.setter
+    def autostart(self, on):
+        if on:
+            os.makedirs(os.path.dirname(AUTOSTART_PATH), exist_ok=True)
+            exe = os.path.realpath(__file__)
+            with open(AUTOSTART_PATH, "w", encoding="utf-8") as f:
+                f.write("[Desktop Entry]\nType=Application\nName=Protux\n"
+                        f"Exec={shlex.quote(exe)} --tray\nIcon=protux\nTerminal=false\nNoDisplay=true\n"
+                        "X-GNOME-Autostart-Delay=5\n")
+        elif os.path.exists(AUTOSTART_PATH):
+            os.unlink(AUTOSTART_PATH)
+
+
+def combo(items):
+    c = QComboBox()
+    for key, label in items:
+        c.addItem(label, key)
+    return c
+
+
+def set_combo(c, key):
+    i = c.findData(key)
+    c.setCurrentIndex(i if i >= 0 else 0)
+
+
+def error_label():
+    lbl = QLabel()
+    lbl.setWordWrap(True)
+    lbl.setStyleSheet("color: #c42b2b;")
+    lbl.hide()
+    return lbl
+
+
+def show_error(lbl, text):
+    lbl.setText(text or "")
+    lbl.setVisible(bool(text))
+
+
+def folder_row(edit, parent):
+    row = QHBoxLayout()
+    row.addWidget(edit, 1)
+    b = QPushButton(tr("Browse…"))
+
+    def pick():
+        d = QFileDialog.getExistingDirectory(parent, tr("Choose a folder"), edit.text() or os.path.expanduser("~"))
+        if d:
+            edit.setText(d)
+
+    b.clicked.connect(pick)
+    row.addWidget(b)
+    return row
+
+
+def password_edit():
+    e = QLineEdit()
+    e.setEchoMode(QLineEdit.EchoMode.Password)
+    return e
+
+
+class TextDialog(QDialog):
+    """Read-only rich/markdown/plain text with optional extra buttons."""
+
+    def __init__(self, parent, title, text, markdown=False, plain=False, buttons=()):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowIcon(drive_qicon())
+        self.resize(680, 520)
+        if plain:
+            self.view = QPlainTextEdit(text)
+            self.view.setReadOnly(True)
+            self.view.setFont(QFont("monospace"))
+        else:
+            self.view = QTextBrowser()
+            self.view.setOpenExternalLinks(True)
+            self.view.setMarkdown(text) if markdown else self.view.setHtml(text)
+        row = QHBoxLayout()
+        for label, fn in buttons:
+            b = QPushButton(label)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch()
+        close = QPushButton(tr("Close"))
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.view)
+        lay.addLayout(row)
+
+
+# ---------------------------------------------------------------------------
+# setup wizard
+# ---------------------------------------------------------------------------
+
+class IntroPage(QWizardPage):
+    def __init__(self, info):
+        super().__init__()
+        self.setTitle(tr("Welcome to Protux"))
+        self.setSubTitle(tr("Your Proton Drive as a folder on this computer. Let's connect your account."))
+        lay = QVBoxLayout(self)
+        self.ok = True
+        box = QGroupBox(tr("Requirements"))
+        form = QFormLayout(box)
+        for good, name, detail in ((info.get("rclone_protondrive") == "1", "rclone",
+                                    info.get("rclone_version") or tr("not found or too old (1.64 or newer needed)")),
+                                   (info.get("fuse") == "1", "FUSE", "/dev/fuse")):
+            mark = QLabel(("✓  " if good else "✗  ") + detail)
+            mark.setStyleSheet(f"color: {'#2ea043' if good else '#c42b2b'};")
+            form.addRow(f"{name}:", mark)
+            self.ok = self.ok and good
+        lay.addWidget(box)
+        lay.addStretch()
+
+    def isComplete(self):
+        return self.ok
+
+
+class AccountPage(QWizardPage):
+    def __init__(self, wizard, info):
+        super().__init__()
+        self.wiz, self.info = wizard, info
+        exists = info.get("remote_exists") == "1"
+        self.setTitle(tr("Proton account"))
+        self.setSubTitle(tr("Leave the passwords empty to keep the ones already saved.") if exists
+                         else tr("The same email and password you use at proton.me."))
+        self.email = QLineEdit(info.get("username", ""))
+        self.password = password_edit()
+        self.two = QCheckBox(tr("My account uses two-password mode (a second password for the mailbox)"))
+        self.two.setChecked(info.get("mailbox") == "1")
+        self.mailbox = password_edit()
+        self.mailbox_label = QLabel(tr("Second password:"))
+        self.two.toggled.connect(self._two)
+        self.error = error_label()
+        form = QFormLayout(self)
+        form.addRow(tr("Email:"), self.email)
+        form.addRow(tr("Password:"), self.password)
+        form.addRow("", self.two)
+        form.addRow(self.mailbox_label, self.mailbox)
+        form.addRow("", self.error)
+        note = QLabel(tr("<small>The passwords are kept obscured in the rclone config file. Encrypt that "
+                         "file and keep its password in the keyring for real protection.</small>"))
+        note.setWordWrap(True)
+        form.addRow("", note)
+        self._two(self.two.isChecked())
+        self.focus = self.email
+
+    def _two(self, on):
+        self.mailbox.setVisible(on)
+        self.mailbox_label.setVisible(on)
+
+    def initializePage(self):
+        QTimer.singleShot(0, self.focus.setFocus)
+
+    def validatePage(self):
+        email, pw = self.email.text().strip(), self.password.text()
+        mb = self.mailbox.text() if self.two.isChecked() else ""
+        exists = self.info.get("remote_exists") == "1"
+        if not exists and (not email or not pw):
+            show_error(self.error, tr("Email and password are required."))
+            return False
+        if self.two.isChecked() and not mb and self.info.get("mailbox") != "1":
+            show_error(self.error, tr("Enter the second password."))
+            self.mailbox.setFocus()
+            return False
+        show_error(self.error, None)
+        args = ["__set-credentials"] + ([] if self.two.isChecked() else ["--clear-mailbox"])
+        rc, _out, err = self.wiz.runner.wait(args, f"{email}\n{pw}\n{mb}\n")
+        if rc != 0:
+            show_error(self.error, err or tr("Could not save the credentials."))
+            return False
+        self.info["remote_exists"] = "1"
+        if mb:
+            self.info["mailbox"] = "1"
+        return True
+
+    def point_at(self, rc, err):
+        """Back here after a login error, with the cursor in the field that's wrong."""
+        show_error(self.error, login_error(rc, err))
+        if rc == EX_MAILBOX:
+            self.two.setChecked(True)
+            self.mailbox.clear()
+            self.focus = self.mailbox
+        else:
+            self.password.clear()
+            self.focus = self.password
+        self.focus.setFocus()
+
+
+class VerifyPage(QWizardPage):
+    def __init__(self, wizard):
+        super().__init__()
+        self.wiz = wizard
+        self.setTitle(tr("Verification"))
+        self.setSubTitle(tr("Enter the 6-digit code from your authenticator app."))
+        self.code = QLineEdit()
+        self.code.setMaxLength(8)
+        self.code.setPlaceholderText("123456")
+        self.no2fa = QCheckBox(tr("My account doesn't use 2FA"))
+        self.no2fa.toggled.connect(lambda on: self.code.setEnabled(not on))
+        self.error = error_label()
+        form = QFormLayout(self)
+        form.addRow(tr("2FA code:"), self.code)
+        form.addRow("", self.no2fa)
+        form.addRow("", self.error)
+
+    def initializePage(self):
+        self.code.clear()
+        show_error(self.error, None)
+        QTimer.singleShot(0, self.code.setFocus)
+
+    def validatePage(self):
+        code = re.sub(r"\s", "", self.code.text())
+        if not self.no2fa.isChecked() and not re.fullmatch(r"\d{6}", code):
+            show_error(self.error, tr("The code must have 6 digits."))
+            return False
+        show_error(self.error, tr("Connecting…"))
+        self.wiz.button(QWizard.WizardButton.NextButton).setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            rc, _out, err = self.wiz.runner.wait(["__login"], ("" if self.no2fa.isChecked() else code) + "\n")
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.wiz.button(QWizard.WizardButton.NextButton).setEnabled(True)
+        if rc in (EX_PASSWORD, EX_MAILBOX):
+            show_error(self.error, None)
+            QTimer.singleShot(0, lambda: (self.wiz.back(), self.wiz.account.point_at(rc, err)))
+            return False
+        if rc != EX_OK:
+            show_error(self.error, login_error(rc, err))
+            self.code.clear()
+            self.code.setFocus()
+            return False
+        show_error(self.error, None)
+        return True
+
+
+class FolderPage(QWizardPage):
+    def __init__(self, wizard, settings):
+        super().__init__()
+        self.wiz = wizard
+        self.setTitle(tr("Folder"))
+        self.setSubTitle(tr("Where your Proton Drive files will appear."))
+        self.path = QLineEdit(settings.get("MOUNTPOINT", "/media/ProtonDrive"))
+        self.auto = QCheckBox(tr("Mount the drive automatically when I log in"))
+        self.auto.setChecked(True)
+        self.tray = QCheckBox(tr("Show Protux in the system tray when I log in"))
+        self.tray.setChecked(True)
+        self.error = error_label()
+        form = QFormLayout(self)
+        form.addRow(tr("Mount at:"), folder_row(self.path, self))
+        hint = QLabel(tr("<small>A folder in a system location such as /media is created once with your "
+                         "administrator password, and then belongs to you.</small>"))
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        form.addRow("", self.auto)
+        form.addRow("", self.tray)
+        form.addRow("", self.error)
+
+    def validatePage(self):
+        path = os.path.expanduser(self.path.text().strip())
+        if not path.startswith("/"):
+            show_error(self.error, tr("Use a full path, such as /media/ProtonDrive."))
+            return False
+        r = self.wiz.runner
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            rc, _o, err = r.wait(["__set-config", "MOUNTPOINT", path])
+            if rc == 0:
+                rc, _o, err = r.wait(["__prepare-mountpoint", path])
+            if rc == 0:
+                r.wait(["enable" if self.auto.isChecked() else "disable"])
+                show_error(self.error, tr("Mounting…"))
+                rc, _o, err = r.wait(["start"])
+        finally:
+            QApplication.restoreOverrideCursor()
+        if rc != 0:
+            show_error(self.error, err or tr("The drive did not mount."))
+            return False
+        self.wiz.app.settings.autostart = self.tray.isChecked()
+        self.wiz.mountpoint = path
+        show_error(self.error, None)
+        return True
+
+
+class DonePage(QWizardPage):
+    def __init__(self, wizard):
+        super().__init__()
+        self.wiz = wizard
+        self.setTitle(tr("All set"))
+        self.text = QLabel()
+        self.text.setWordWrap(True)
+        b = QPushButton(tr("Open folder"))
+        b.clicked.connect(lambda: open_folder(self.wiz.mountpoint))
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.text)
+        row = QHBoxLayout()
+        row.addWidget(b)
+        row.addStretch()
+        lay.addLayout(row)
+        lay.addStretch()
+
+    def initializePage(self):
+        self.text.setText(tr("Your files are in {0}.").format(self.wiz.mountpoint)
+                          + "\n\n" + tr("Protux keeps an eye on the drive from the system tray."))
+
+
+class SetupWizard(QWizard):
+    def __init__(self, app, parent=None):
+        super().__init__(parent)
+        self.app, self.runner = app, app.runner
+        self.mountpoint = ""
+        info = parse_kv(cli(["__info"])[1])
+        settings = parse_kv(cli(["__get-config"])[1])
+        self.setWindowTitle(tr("Protux setup"))
+        self.setWindowIcon(drive_qicon())
+        self.setPixmap(QWizard.WizardPixmap.LogoPixmap, drive_icon("up", 64))
+        self.setOption(QWizard.WizardOption.NoBackButtonOnLastPage, True)
+        self.setOption(QWizard.WizardOption.NoCancelButtonOnLastPage, True)
+        self.account = AccountPage(self, info)
+        for page in (IntroPage(info), self.account, VerifyPage(self), FolderPage(self, settings), DonePage(self)):
+            self.addPage(page)
+        self.resize(640, 480)
+
+
+# ---------------------------------------------------------------------------
+# dialogs
+# ---------------------------------------------------------------------------
+
+class LoginDialog(QDialog):
+    """Renew the session: 2FA code, plus the passwords if Proton rejects them."""
+
+    def __init__(self, app, parent=None):
+        super().__init__(parent)
+        self.app = app
+        self.setWindowTitle(tr("Protux – log in"))
+        self.setWindowIcon(drive_qicon())
+        head = QHBoxLayout()
+        icon = QLabel()
+        icon.setPixmap(drive_icon("error", 48))
+        head.addWidget(icon)
+        txt = QLabel(tr("<b>Your Proton Drive session expired.</b><br>Enter the 6-digit code from your "
+                        "authenticator app to connect again."))
+        txt.setWordWrap(True)
+        head.addWidget(txt, 1)
+        self.code = QLineEdit()
+        self.code.setMaxLength(8)
+        self.code.setPlaceholderText("123456")
+        self.no2fa = QCheckBox(tr("My account doesn't use 2FA"))
+        self.no2fa.toggled.connect(lambda on: self.code.setEnabled(not on))
+        self.password = password_edit()
+        self.mailbox = password_edit()
+        self.error = error_label()
+        self.form = QFormLayout()
+        self.form.addRow(tr("2FA code:"), self.code)
+        self.form.addRow("", self.no2fa)
+        self.form.addRow(tr("Password:"), self.password)
+        self.form.addRow(tr("Second password:"), self.mailbox)
+        self.form.setRowVisible(2, False)
+        self.form.setRowVisible(3, False)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self.ok = self.buttons.addButton(tr("Log in"), QDialogButtonBox.ButtonRole.AcceptRole)
+        self.ok.setDefault(True)
+        self.buttons.accepted.connect(self.submit)
+        self.buttons.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addLayout(head)
+        lay.addLayout(self.form)
+        lay.addWidget(self.error)
+        lay.addWidget(self.buttons)
+        self.setMinimumWidth(440)
+        self.code.setFocus()
+
+    def submit(self):
+        code = re.sub(r"\s", "", self.code.text())
+        if not self.no2fa.isChecked() and not re.fullmatch(r"\d{6}", code):
+            show_error(self.error, tr("The code must have 6 digits."))
+            return
+        self.ok.setEnabled(False)
+        show_error(self.error, tr("Logging in…"))
+        r = self.app.runner
+        pw = self.password.text() if self.form.isRowVisible(2) else ""
+        mb = self.mailbox.text() if self.form.isRowVisible(3) else ""
+        if pw or mb:
+            rc, _o, err = r.wait(["__set-credentials"], f"\n{pw}\n{mb}\n")
+            if rc != 0:
+                return self.failed(1, err)
+        rc, _o, err = r.wait(["__login"], ("" if self.no2fa.isChecked() else code) + "\n")
+        if rc != EX_OK:
+            return self.failed(rc, err)
+        show_error(self.error, tr("Mounting…"))
+        rc, _o, err = r.wait(["start"])
+        if rc != 0:
+            return self.failed(rc, err or tr("The drive did not mount."))
+        self.app.refresh()
+        self.accept()
+
+    def failed(self, rc, err):
+        self.ok.setEnabled(True)
+        show_error(self.error, login_error(rc, err))
+        if rc == EX_PASSWORD:
+            self.form.setRowVisible(2, True)
+            self.password.setFocus()
+        elif rc == EX_MAILBOX:
+            self.form.setRowVisible(3, True)
+            self.mailbox.setFocus()
+        else:
+            self.code.clear()
+            self.code.setFocus()
+
+
+class PasswordsDialog(QDialog):
+    def __init__(self, app, parent, info):
+        super().__init__(parent)
+        self.app = app
+        self.setWindowTitle(tr("Change passwords"))
+        self.setWindowIcon(drive_qicon())
+        intro = QLabel(tr("Use this after changing your password at proton.me. Leave a field empty to keep "
+                          "what is saved. You will log in again afterwards."))
+        intro.setWordWrap(True)
+        self.password = password_edit()
+        self.two = QCheckBox(tr("My account uses two-password mode (a second password for the mailbox)"))
+        self.two.setChecked(info.get("mailbox") == "1")
+        self.mailbox = password_edit()
+        self.two.toggled.connect(self.mailbox.setEnabled)
+        self.mailbox.setEnabled(self.two.isChecked())
+        self.error = error_label()
+        form = QFormLayout()
+        form.addRow(tr("New password:"), self.password)
+        form.addRow("", self.two)
+        form.addRow(tr("Second password:"), self.mailbox)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.save)
+        bb.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addWidget(intro)
+        lay.addLayout(form)
+        lay.addWidget(self.error)
+        lay.addWidget(bb)
+        self.setMinimumWidth(460)
+
+    def save(self):
+        args = ["__set-credentials"] + ([] if self.two.isChecked() else ["--clear-mailbox"])
+        mb = self.mailbox.text() if self.two.isChecked() else ""
+        rc, _o, err = self.app.runner.wait(args, f"\n{self.password.text()}\n{mb}\n")
+        if rc != 0:
+            show_error(self.error, err or tr("Could not save the credentials."))
+            return
+        self.accept()
+        self.app.runner.wait(["stop"])
+        self.app.login()
+
+
+CACHE_MODES = [("off", tr("Off")), ("minimal", tr("Minimal")), ("writes", tr("Writes (recommended)")),
+               ("full", tr("Full"))]
+LOG_LEVELS = [(x, x) for x in ("ERROR", "NOTICE", "INFO", "DEBUG")]
+KEYRING_MODES = [("auto", tr("Automatic (only if the rclone config is encrypted)")), ("yes", tr("Always")),
+                 ("no", tr("Never"))]
+SIZE_RE = re.compile(r"^(\d+(\.\d+)?[KMGTP]?|off)$", re.I)
+DURATION_RE = re.compile(r"^((\d+(\.\d+)?(ms|s|m|min|h|d|w|M|y))+|off)$")
+# settings that only take effect when the drive is mounted again
+REMOUNT_KEYS = {"MOUNTPOINT", "RCLONE", "RCLONE_CONFIG", "REMOTE", "KEYRING", "CACHE_DIR", "VFS_CACHE_MODE",
+                "VFS_CACHE_MAX_SIZE", "VFS_CACHE_MAX_AGE", "VFS_WRITE_BACK", "DIR_CACHE_TIME", "BUFFER_SIZE",
+                "UMASK", "ALLOW_OTHER", "LOG_LEVEL", "EXTRA_ARGS"}
+
+
+class PrefsDialog(QDialog):
+    def __init__(self, app, parent):
+        super().__init__(parent)
+        self.app = app
+        self.cfg = parse_kv(cli(["__get-config"])[1])
+        self.info = parse_kv(cli(["__info"])[1])
+        self.setWindowTitle(tr("Protux preferences"))
+        self.setWindowIcon(drive_qicon())
+        self.resize(600, 460)
+        self.fields = {}       # config key -> (widget, validator)
+        tabs = QTabWidget()
+
+        # --- general
+        g = QFormLayout()
+        self.mountpoint = self._edit("MOUNTPOINT")
+        g.addRow(tr("Mount at:"), folder_row(self.mountpoint, self))
+        self.auto_mount = QCheckBox(tr("Mount the drive automatically when I log in"))
+        self.auto_mount.setChecked(self.info.get("enabled") == "enabled")
+        g.addRow("", self.auto_mount)
+        self.autostart = QCheckBox(tr("Show Protux in the system tray when I log in"))
+        self.autostart.setChecked(app.settings.autostart)
+        g.addRow("", self.autostart)
+        self.start_hidden = QCheckBox(tr("At startup, show only the tray icon"))
+        self.start_hidden.setChecked(app.settings.data.get("start_hidden", True))
+        g.addRow("", self.start_hidden)
+        self.notify = QCheckBox(tr("Notify when the drive connects or disconnects"))
+        self.notify.setChecked(app.settings.data.get("notifications", True))
+        g.addRow("", self.notify)
+        self.fm = self._edit("FILE_MANAGER")
+        self.fm.setPlaceholderText(tr("Automatic (your desktop's file manager)"))
+        g.addRow(tr("File manager:"), self.fm)
+        self.check_updates = QCheckBox(tr("Check for updates on GitHub once a day"))
+        self.check_updates.setChecked(app.settings.data.get("check_updates", True))
+        g.addRow("", self.check_updates)
+        tabs.addTab(self._page(g), tr("General"))
+
+        # --- account
+        a = QFormLayout()
+        a.addRow(tr("Email:"), QLabel(self.info.get("username") or "—"))
+        a.addRow(tr("Two-password mode:"), QLabel(tr("Yes") if self.info.get("mailbox") == "1" else tr("No")))
+        pw = QPushButton(tr("Change passwords…"))
+        pw.clicked.connect(lambda: (self.reject(), app.change_passwords()))
+        a.addRow("", pw)
+        relog = QPushButton(tr("Log in again…"))
+        relog.clicked.connect(lambda: (self.reject(), app.login()))
+        a.addRow("", relog)
+        a.addRow("", QLabel(tr("<small>Remote <b>{0}</b> in {1}</small>").format(
+            self.cfg.get("REMOTE", ""), self.cfg.get("RCLONE_CONFIG", ""))))
+        tabs.addTab(self._page(a), tr("Account"))
+
+        # --- access
+        x = QFormLayout()
+        self.allow_other = QCheckBox(tr("Let other users see the drive (root, Docker containers, virtual machines)"))
+        self.allow_other.setChecked(self.cfg.get("ALLOW_OTHER") == "yes")
+        x.addRow("", self.allow_other)
+        if self.info.get("user_allow_other") != "1":
+            x.addRow("", QLabel(tr("<small>Needs <code>user_allow_other</code> in /etc/fuse.conf.</small>")))
+        x.addRow(tr("Permissions mask:"), self._edit("UMASK", re.compile(r"^[0-7]{3,4}$")))
+        tabs.addTab(self._page(x), tr("Access"))
+
+        # --- cache
+        c = QFormLayout()
+        intro = QLabel(tr("Files are kept on disk while they upload and for quick reopening."))
+        intro.setWordWrap(True)
+        c.addRow(intro)
+        self.cache_mode = combo(CACHE_MODES)
+        set_combo(self.cache_mode, self.cfg.get("VFS_CACHE_MODE", "writes"))
+        c.addRow(tr("Cache mode:"), self.cache_mode)
+        c.addRow(tr("Maximum size:"), self._edit("VFS_CACHE_MAX_SIZE", SIZE_RE, "10G"))
+        c.addRow(tr("Keep files for:"), self._edit("VFS_CACHE_MAX_AGE", DURATION_RE, "24h"))
+        c.addRow(tr("Upload changes after:"), self._edit("VFS_WRITE_BACK", DURATION_RE, "5s"))
+        c.addRow(tr("Refresh folder listings every:"), self._edit("DIR_CACHE_TIME", DURATION_RE, "30s"))
+        c.addRow(tr("Read buffer:"), self._edit("BUFFER_SIZE", SIZE_RE, "16M"))
+        c.addRow(tr("Cache folder:"), folder_row(self._edit("CACHE_DIR"), self))
+        if self.info.get("cache_size"):
+            c.addRow(tr("In use:"), QLabel(self.info["cache_size"]))
+        tabs.addTab(self._page(c), tr("Cache"))
+
+        # --- advanced
+        v = QFormLayout()
+        v.addRow(tr("rclone program:"), self._edit("RCLONE"))
+        v.addRow(tr("rclone config file:"), self._edit("RCLONE_CONFIG"))
+        v.addRow(tr("Remote name:"), self._edit("REMOTE", re.compile(r"^[\w.\- ]+$")))
+        self.keyring = combo(KEYRING_MODES)
+        set_combo(self.keyring, self.cfg.get("KEYRING", "auto"))
+        v.addRow(tr("Config password from the keyring:"), self.keyring)
+        v.addRow(tr("Extra rclone flags:"), self._edit("EXTRA_ARGS"))
+        self.log_level = combo(LOG_LEVELS)
+        set_combo(self.log_level, self.cfg.get("LOG_LEVEL", "INFO"))
+        v.addRow(tr("Log level:"), self.log_level)
+        v.addRow(tr("Ask again after Proton blocks logins:"), self._edit("RETRY_429_AFTER", DURATION_RE, "65min"))
+        tabs.addTab(self._page(v), tr("Advanced"))
+
+        self.error = error_label()
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.save)
+        bb.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addWidget(tabs)
+        lay.addWidget(self.error)
+        lay.addWidget(bb)
+
+    def _page(self, form):
+        w = QWidget()
+        w.setLayout(form)
+        return w
+
+    def _edit(self, key, check=None, placeholder=None):
+        e = QLineEdit(self.cfg.get(key, ""))
+        if placeholder:
+            e.setPlaceholderText(placeholder)
+        self.fields[key] = (e, check)
+        return e
+
+    def save(self):
+        changes = {}
+        for key, (w, check) in self.fields.items():
+            val = w.text().strip()
+            if key != "EXTRA_ARGS" and check and val and not check.match(val):
+                show_error(self.error, tr("Invalid value: {0}").format(val))
+                w.setFocus()
+                return
+            if key == "MOUNTPOINT" and not os.path.expanduser(val).startswith("/"):
+                show_error(self.error, tr("Use a full path, such as /media/ProtonDrive."))
+                w.setFocus()
+                return
+            if val != self.cfg.get(key, ""):
+                changes[key] = os.path.expanduser(val) if key in ("MOUNTPOINT", "CACHE_DIR") else val
+        for key, w in (("VFS_CACHE_MODE", self.cache_mode), ("KEYRING", self.keyring), ("LOG_LEVEL", self.log_level)):
+            if w.currentData() != self.cfg.get(key):
+                changes[key] = w.currentData()
+        if self.allow_other.isChecked() != (self.cfg.get("ALLOW_OTHER") == "yes"):
+            changes["ALLOW_OTHER"] = "yes" if self.allow_other.isChecked() else "no"
+        r = self.app.runner
+        if changes:
+            rc, _o, err = r.wait(["__set-config", *[x for kv in changes.items() for x in kv]])
+            if rc != 0:
+                show_error(self.error, err or tr("Could not save"))
+                return
+        if "MOUNTPOINT" in changes:
+            rc, _o, err = r.wait(["__prepare-mountpoint", changes["MOUNTPOINT"]])
+            if rc != 0:
+                show_error(self.error, err or tr("Could not create {0}").format(changes["MOUNTPOINT"]))
+                return
+        if self.auto_mount.isChecked() != (self.info.get("enabled") == "enabled"):
+            r.wait(["enable" if self.auto_mount.isChecked() else "disable"])
+        s = self.app.settings
+        s.autostart = self.autostart.isChecked()
+        s.data.update(start_hidden=self.start_hidden.isChecked(), notifications=self.notify.isChecked(),
+                      check_updates=self.check_updates.isChecked())
+        s.save()
+        self.accept()
+        if REMOUNT_KEYS & changes.keys() and self.app.info.get("mounted") == "1":
+            if QMessageBox.question(self.parent(), APP, tr("Mount the drive again now to apply the changes?")) \
+                    == QMessageBox.StandardButton.Yes:
+                self.app.restart_drive()
+        self.app.refresh(full=True)
+
+
+# ---------------------------------------------------------------------------
+# help menu: about, project links, bug reports, donations, updates
+# ---------------------------------------------------------------------------
+
+REPO_URL = "https://github.com/FrankMncrf/Protux"
+RELEASES_API = "https://api.github.com/repos/FrankMncrf/protux/releases/latest"
+# donation targets; an empty value hides that option
+DONATE = {
+    "bmc": "https://buymeacoffee.com/frankmncrf",
+    "paypal": "",
+    "btc": "bc1qm45kpx35uazdts3q8vc77edqwyajuxe9cexw0er5409dyevl3nysxhln9g",
+}
+THIRD_PARTY = [
+    ("rclone", "MIT", "https://rclone.org"),
+    ("Qt 6", "LGPL-3.0 / GPL", "https://www.qt.io/licensing"),
+    ("PyQt6", "GPL-3.0", "https://www.riverbankcomputing.com/software/pyqt/"),
+    ("Python", "PSF-2.0", "https://www.python.org/psf/license/"),
+    ("libfuse", "LGPL-2.1 / GPL-2.0", "https://github.com/libfuse/libfuse"),
+    ("systemd, libsecret, libnotify", "GPL / LGPL", "https://www.freedesktop.org"),
+]
+
+
+def _version_tuple(text):
+    return tuple(int(x) for x in re.findall(r"\d+", text or "")[:3]) or (0,)
+
+
+def system_info(app):
+    """Versions and feature usage for bug reports. Never the account, paths or secrets."""
+    from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR
+    info = parse_kv(cli(["__info"])[1])
+    distro = "?"
+    try:
+        with open("/etc/os-release", encoding="utf-8") as f:
+            distro = dict(line.rstrip().split("=", 1) for line in f if "=" in line).get("PRETTY_NAME", "?").strip('"')
+    except OSError:
+        pass
+    return "\n".join([
+        f"protux: {info.get('version', '?')} ({UI_LANG})",
+        f"rclone: {info.get('rclone_version', '?')} (protondrive backend: {info.get('rclone_protondrive', '?')})",
+        f"Distro: {distro}",
+        f"Kernel: {os.uname().release}",
+        f"Desktop: {os.environ.get('XDG_CURRENT_DESKTOP', '?')} ({os.environ.get('XDG_SESSION_TYPE', '?')})",
+        f"Python: {sys.version.split()[0]} · Qt: {QT_VERSION_STR} · PyQt: {PYQT_VERSION_STR}",
+        f"Mounted: {'yes' if info.get('mounted') == '1' else 'no'} · Service: {info.get('active', '?')} / "
+        f"{info.get('enabled', '?')} · State: {info.get('state', '?')}",
+        f"Encrypted rclone config: {'yes' if info.get('config_encrypted') == '1' else 'no'} · "
+        f"Keyring: {'yes' if info.get('keyring') == '1' else 'no'} · "
+        f"Two-password mode: {'yes' if info.get('mailbox') == '1' else 'no'}",
+    ])
+
+
+def _doc_file(name):
+    for d in (os.path.join(HERE, ".."), os.path.join(HERE, "..", "share", "doc", "protux"),
+              "/usr/share/doc/protux"):
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+class Help(QObject):
+    update_found = pyqtSignal(str, str)   # version, url
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.update_found.connect(self._update_found)
+
+    def _owner(self):
+        return self.app.window if self.app.window.isVisible() else None
+
+    def about(self):
+        box = QMessageBox(self._owner())
+        box.setWindowTitle(tr("About Protux"))
+        box.setIconPixmap(drive_icon("up", 96))
+        box.setText(f"<h2>Protux {self.app.version}</h2>"
+                    + tr("<p><i>Your Proton Drive on Linux — mounted at login, and it stays that way.</i></p>")
+                    + tr("<p>Proton Drive for Linux: your drive as a folder, kept mounted by systemd "
+                         "and rclone.</p>")
+                    + f"<p>© 2026 FrankMncrf — <a href='{REPO_URL}'>{REPO_URL.replace('https://', '')}</a></p>"
+                    + tr("<p>Free software under the GPL-3.0 license. No warranty.</p>")
+                    + tr("<p><small>Not affiliated with or endorsed by Proton AG. Proton and Proton Drive are "
+                         "trademarks of Proton AG.</small></p>"))
+        box.setTextFormat(Qt.TextFormat.RichText)
+        donate = box.addButton(tr("Donate…"), QMessageBox.ButtonRole.ActionRole)
+        lic = box.addButton(tr("Licenses…"), QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is donate:
+            self.donate()
+        elif box.clickedButton() is lic:
+            self.licenses()
+
+    def repo(self):
+        open_url(REPO_URL)
+
+    def docs(self):
+        open_url(REPO_URL + "#readme")
+
+    def report_bug(self):
+        from urllib.parse import urlencode
+        q = urlencode({"template": "bug_report.yml", "environment": system_info(self.app)})
+        open_url(f"{REPO_URL}/issues/new?{q}")
+
+    def feedback(self):
+        open_url(f"{REPO_URL}/discussions/new?category=ideas")
+
+    def copy_info(self):
+        QApplication.clipboard().setText(system_info(self.app))
+        self.app.notify(tr("System information copied (without your account data)."))
+
+    def donate(self):
+        dlg = QDialog(self._owner())
+        dlg.setWindowTitle(tr("Support protux"))
+        dlg.setWindowIcon(drive_qicon())
+        lay = QVBoxLayout(dlg)
+        intro = QLabel(tr("protux is free software. If you find it useful, you can support its development:"))
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        if DONATE.get("bmc"):
+            b = QPushButton("☕  Buy Me a Coffee")
+            b.clicked.connect(lambda: open_url(DONATE["bmc"]))
+            lay.addWidget(b)
+        if DONATE.get("paypal"):
+            b = QPushButton("PayPal")
+            b.clicked.connect(lambda: open_url(DONATE["paypal"]))
+            lay.addWidget(b)
+        if DONATE.get("btc"):
+            row = QHBoxLayout()
+            addr = QLineEdit(DONATE["btc"])
+            addr.setReadOnly(True)
+            copy = QPushButton(tr("Copy"))
+            copy.clicked.connect(lambda: QApplication.clipboard().setText(DONATE["btc"]))
+            wallet = QPushButton(tr("Open in my wallet"))
+            wallet.clicked.connect(lambda: open_url(f"bitcoin:{DONATE['btc']}?message=protux"))
+            row.addWidget(QLabel("₿ Bitcoin:"))
+            row.addWidget(addr, 1)
+            row.addWidget(copy)
+            row.addWidget(wallet)
+            lay.addLayout(row)
+        star = QPushButton(tr("★  Star it on GitHub"))
+        star.clicked.connect(self.repo)
+        lay.addWidget(star)
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(dlg.reject)
+        lay.addWidget(close)
+        dlg.setMinimumWidth(460)
+        dlg.exec()
+
+    def shortcuts(self):
+        w = self.app.window
+        rows = "".join(f"<tr><td><b>{a.shortcut().toString(QKeySequence.SequenceFormat.NativeText)}</b></td>"
+                       f"<td>{a.text().replace('&', '')}</td></tr>"
+                       for a in w.findChildren(QAction) if not a.shortcut().isEmpty())
+        usage = cli(["help"])[1]
+        TextDialog(self._owner(), tr("Keyboard shortcuts"),
+                   f"<h3>{tr('Main window')}</h3><table cellpadding=4>{rows}</table>"
+                   f"<h3>{tr('Terminal')}</h3><pre>{usage}</pre>").exec()
+
+    def changelog(self):
+        path = _doc_file("CHANGELOG.md")
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except (OSError, TypeError):
+            text = f"[{REPO_URL}/releases]({REPO_URL}/releases)"
+        TextDialog(self._owner(), tr("What's new"), text, markdown=True).exec()
+
+    def licenses(self):
+        rows = "".join(f"<tr><td><a href='{url}'>{name}</a></td><td>{lic}</td></tr>" for name, lic, url in THIRD_PARTY)
+        TextDialog(self._owner(), tr("Licenses"),
+                   f"<h3>protux</h3><p>GPL-3.0-or-later — "
+                   f"<a href='https://www.gnu.org/licenses/gpl-3.0.html'>gnu.org/licenses/gpl-3.0</a></p>"
+                   f"<h3>{tr('Third-party components')}</h3><table cellpadding=4>{rows}</table>"
+                   f"<p><small>{tr('Not affiliated with or endorsed by Proton AG.')}</small></p>").exec()
+
+    # --- updates
+    def check_updates(self, manual=True):
+        def worker():
+            try:
+                req = urllib.request.Request(RELEASES_API, headers={"User-Agent": f"protux/{self.app.version}",
+                                                                    "Accept": "application/vnd.github+json"})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = json.loads(r.read(200000))
+                tag, url = data.get("tag_name", ""), data.get("html_url", REPO_URL + "/releases")
+            except (OSError, ValueError):
+                tag, url = "", ""
+            self.update_found.emit(tag if manual or tag else "", url if tag else ("" if not manual else "error"))
+
+        self.app.settings.data["update_checked"] = time.strftime("%Y-%m-%d")
+        self.app.settings.save()
+        self._manual = manual
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_found(self, tag, url):
+        manual = getattr(self, "_manual", False)
+        if tag and _version_tuple(tag) > _version_tuple(self.app.version):
+            msg = tr("There is a new version of protux: {0} (you have {1}).").format(tag, self.app.version)
+            if manual:
+                box = QMessageBox(self._owner())
+                box.setWindowTitle(APP)
+                box.setText(msg + "\n\n" + tr("Update it with your distribution's package manager or download "
+                                              "it from GitHub."))
+                see = box.addButton(tr("See the release"), QMessageBox.ButtonRole.AcceptRole)
+                box.addButton(QMessageBox.StandardButton.Close)
+                box.exec()
+                if box.clickedButton() is see:
+                    open_url(url)
+            else:
+                self.app.notify(msg, 10000)
+        elif manual:
+            if url == "error":
+                QMessageBox.warning(self._owner(), APP, tr("Could not reach GitHub. Check your internet connection."))
+            else:
+                QMessageBox.information(self._owner(), APP, tr("You have the latest version ({0}).").format(
+                    self.app.version))
+
+    def maybe_auto_check(self):
+        if self.app.settings.data.get("check_updates", True) and \
+                self.app.settings.data.get("update_checked") != time.strftime("%Y-%m-%d"):
+            self.check_updates(manual=False)
+
+    def fill_menu(self, m):
+        for item in ((tr("Documentation"), self.docs), (tr("Keyboard shortcuts"), self.shortcuts),
+                     (tr("What's new"), self.changelog), None,
+                     (tr("Report a bug…"), self.report_bug), (tr("Send feedback…"), self.feedback),
+                     (tr("Copy system information"), self.copy_info), None,
+                     (tr("Check for updates"), self.check_updates),
+                     (tr("GitHub repository"), self.repo), (tr("Donate…"), self.donate), None,
+                     (tr("Third-party licenses"), self.licenses), (tr("About Protux"), self.about)):
+            if item is None:
+                m.addSeparator()
+            else:
+                m.addAction(item[0], (lambda f=item[1]: f()))
+
+
+# ---------------------------------------------------------------------------
+# main window
+# ---------------------------------------------------------------------------
+
+class MainWindow(QMainWindow):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.setWindowTitle(APP)
+        self.setWindowIcon(drive_qicon())
+
+        A = self._action
+        self.a_toggle = A(tr("Mount"), app.toggle_mount, "Ctrl+M")
+        self.a_open = A(tr("Open folder"), lambda: open_folder(app.info.get("mountpoint", "")), "Ctrl+O")
+        self.a_login = A(tr("Log in again…"), app.login, "Ctrl+Shift+L")
+        self.a_passwords = A(tr("Change passwords…"), app.change_passwords)
+        self.a_setup = A(tr("Run the setup wizard…"), app.show_wizard)
+        self.a_prefs = A(tr("Preferences…"), app.show_prefs, "Ctrl+,")
+        self.a_log = A(tr("Log"), app.show_log, "Ctrl+L")
+        self.a_refresh = A(tr("Refresh"), lambda: app.refresh(full=True), "F5")
+        self.a_quit = A(tr("Quit"), app.quit, "Ctrl+Q")
+
+        mb = self.menuBar()
+        m = mb.addMenu(tr("&File"))
+        for a in (self.a_setup, None, self.a_prefs, None, self.a_quit):
+            m.addSeparator() if a is None else m.addAction(a)
+        m = mb.addMenu(tr("&Drive"))
+        for a in (self.a_toggle, self.a_open, None, self.a_login, self.a_passwords):
+            m.addSeparator() if a is None else m.addAction(a)
+        m = mb.addMenu(tr("&View"))
+        m.addAction(self.a_log)
+        m.addAction(self.a_refresh)
+        app.help.fill_menu(mb.addMenu(tr("&Help")))
+
+        # --- state header
+        self.icon = QLabel()
+        self.title = QLabel()
+        f = self.title.font()
+        f.setPointSizeF(f.pointSizeF() * 1.5)
+        f.setBold(True)
+        self.title.setFont(f)
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        head = QHBoxLayout()
+        head.addWidget(self.icon)
+        texts = QVBoxLayout()
+        texts.addStretch()
+        texts.addWidget(self.title)
+        texts.addWidget(self.hint)
+        texts.addStretch()
+        head.addLayout(texts, 1)
+
+        # --- details
+        self.d = {}
+        details = QGroupBox(tr("Details"))
+        form = QFormLayout(details)
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(6)
+        for key, label in (("account", tr("Account")), ("folder", tr("Folder")), ("session", tr("Session")),
+                           ("service", tr("Service")), ("autostart", tr("At login")), ("cache", tr("Cache")),
+                           ("rclone", "rclone")):
+            self.d[key] = QLabel("—")
+            self.d[key].setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            form.addRow(f"{label}:", self.d[key])
+
+        # --- buttons
+        self.toggle_btn = QPushButton(tr("Mount"))
+        self.toggle_btn.clicked.connect(self.a_toggle.trigger)
+        fm = self.toggle_btn.fontMetrics()
+        self.toggle_btn.setMinimumWidth(max(fm.horizontalAdvance(t) for t in (tr("Mount"), tr("Unmount"))) + 32)
+        self.open_btn = QPushButton(tr("Open folder"))
+        self.open_btn.clicked.connect(self.a_open.trigger)
+        self.login_btn = QPushButton(tr("Log in again…"))
+        self.login_btn.clicked.connect(self.a_login.trigger)
+        prefs = QPushButton(tr("Preferences…"))
+        prefs.clicked.connect(self.a_prefs.trigger)
+        row = QHBoxLayout()
+        row.addWidget(self.toggle_btn)
+        row.addWidget(self.open_btn)
+        row.addSpacing(12)
+        row.addWidget(self.login_btn)
+        row.addStretch()
+        row.addWidget(prefs)
+
+        lay = QVBoxLayout()
+        lay.addLayout(head)
+        lay.addSpacing(6)
+        lay.addWidget(details)
+        lay.addStretch()
+        lay.addLayout(row)
+        w = QWidget()
+        w.setLayout(lay)
+        self.setCentralWidget(w)
+        self.resize(560, 420)
+
+    def _action(self, text, fn, shortcut=None):
+        a = QAction(text, self)
+        a.triggered.connect(lambda _=False: fn())
+        if shortcut:
+            a.setShortcut(QKeySequence(shortcut))
+        self.addAction(a)
+        return a
+
+    def update_view(self, info, state, busy):
+        mounted = state == "up"
+        self.icon.setPixmap(drive_icon(state, 64))
+        self.title.setText(STATE_LABELS[state])
+        st = info.get("state", "unknown")
+        if mounted:
+            hint = tr("Your files are in {0}.").format(info.get("mountpoint", ""))
+        elif state == "error":
+            hint = STATE_HINTS.get(st) or info.get("state_msg") or ""
+        elif state == "connecting":
+            hint = tr("Logging in to Proton and mounting the drive…")
+        else:
+            hint = tr("The drive is not mounted.")
+        self.hint.setText(hint)
+        self.d["account"].setText(info.get("username") or "—")
+        self.d["folder"].setText(info.get("mountpoint") or "—")
+        self.d["session"].setText(tr("Active") if mounted else SESSION_LABELS.get(st, tr("Not logged in")))
+        self.d["service"].setText({"active": tr("running"), "inactive": tr("stopped"), "failed": tr("failed"),
+                                   "activating": tr("starting")}.get(info.get("active"), info.get("active") or "—"))
+        self.d["autostart"].setText(tr("Mounts automatically") if info.get("enabled") == "enabled"
+                                    else tr("Mounted by hand"))
+        self.d["cache"].setText(info.get("cache_size") or "—")
+        self.d["rclone"].setText(info.get("rclone_version") or "—")
+        self.a_toggle.setText(tr("Unmount") if mounted else tr("Mount"))
+        self.toggle_btn.setText(self.a_toggle.text())
+        self.a_toggle.setEnabled(not busy)
+        self.toggle_btn.setEnabled(not busy)
+        self.a_open.setEnabled(mounted)
+        self.open_btn.setEnabled(mounted)
+        self.login_btn.setVisible(st in ("auth", "password", "mailbox", "captcha") and not mounted)
+
+    def closeEvent(self, event):
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            event.ignore()
+            self.hide()
+        else:
+            event.accept()
+            self.app.quit()
+
+
+class LogWindow(TextDialog):
+    def __init__(self, parent):
+        super().__init__(parent, tr("Log"), "", plain=True, buttons=((tr("Refresh"), self.reload),))
+        self.reload()
+
+    def reload(self):
+        self.view.setPlainText(cli(["logs", "-n", "300"])[1] or tr("Empty"))
+        self.view.moveCursor(self.view.textCursor().MoveOperation.End)
+
+
+# ---------------------------------------------------------------------------
+# the application: tray icon + window
+# ---------------------------------------------------------------------------
+
+class Protux(QObject):
+    def __init__(self, qapp):
+        super().__init__()
+        self.qapp = qapp
+        self.settings = Settings()
+        self.runner = Runner(self)
+        qapp.aboutToQuit.connect(self.runner.shutdown)
+        self.info = parse_kv(cli(["__info"])[1])
+        self.version = self.info.get("version", "")
+        self.busy = False
+        self.prev_state = None
+        self.help = Help(self)
+        self.window = MainWindow(self)
+        self.wizard = None
+
+        self.tray = QSystemTrayIcon(drive_qicon("down", outline=True))
+        self.tray.setToolTip(APP)
+        self.menu = QMenu()
+        self.tray.setContextMenu(self.menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.show()
+        self.update_view()
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(POLL_MS)
+        QTimer.singleShot(30000, self.help.maybe_auto_check)
+
+    # --- state
+    def state(self):
+        return drive_state(self.info, self.busy)
+
+    def refresh(self, full=False):
+        def done(_rc, out, _err):
+            self.info.update(parse_kv(out))
+            self.update_view()
+
+        self.runner.run(["__info"] if full else ["__info", "--quick"], done)
+
+    def update_view(self):
+        state = self.state()
+        if self.prev_state and state != self.prev_state and not self.busy:
+            if state == "up":
+                self.notify(tr("Proton Drive connected: {0}").format(self.info.get("mountpoint", "")))
+            elif self.prev_state == "up":
+                self.notify(tr("Proton Drive disconnected."))
+        self.prev_state = state
+        self.tray.setIcon(drive_qicon(state, outline=True))
+        tip = STATE_LABELS[state]
+        if state == "up":
+            tip += "\n" + self.info.get("mountpoint", "")
+        elif state == "error":
+            tip += "\n" + SESSION_LABELS.get(self.info.get("state"), "")
+        self.tray.setToolTip(f"{APP} – {tip}")
+        self.window.update_view(self.info, state, self.busy)
+        self._build_menu()
+
+    def notify(self, text, ms=4000):
+        if self.settings.data.get("notifications", True) and QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.showMessage(APP, text, drive_qicon(self.state()), ms)
+
+    def _parent(self):
+        return self.window if self.window.isVisible() else None
+
+    # --- actions
+    def toggle_mount(self):
+        mounted = self.info.get("mounted") == "1"
+        self.busy = True
+        self.update_view()
+
+        def done(rc, _out, err):
+            self.busy = False
+            self.info.update(parse_kv(cli(["__info", "--quick"])[1]))
+            if rc != 0:
+                if self.info.get("state") in ("auth", "password", "mailbox"):
+                    self.login()
+                else:
+                    QMessageBox.warning(self._parent(), APP, err or tr("The drive did not mount."))
+            self.refresh(full=True)
+
+        self.runner.run(["stop" if mounted else "start"], done)
+
+    def restart_drive(self):
+        self.busy = True
+        self.update_view()
+        self.runner.run(["restart"], lambda *_: (setattr(self, "busy", False), self.refresh(full=True)))
+
+    def login(self):
+        LoginDialog(self, self._parent()).exec()
+        self.refresh(full=True)
+
+    def change_passwords(self):
+        PasswordsDialog(self, self._parent(), self.info).exec()
+
+    def show_prefs(self):
+        PrefsDialog(self, self._parent()).exec()
+
+    def show_log(self):
+        LogWindow(self._parent()).exec()
+
+    def show_window(self):
+        self.window.show()
+        self.window.raise_()
+        self.window.activateWindow()
+        self.refresh(full=True)
+
+    def show_wizard(self):
+        if self.wizard and self.wizard.isVisible():
+            self.wizard.raise_()
+            return
+        self.wizard = SetupWizard(self)
+        self.wizard.finished.connect(self._wizard_done)
+        self.wizard.show()
+
+    def _wizard_done(self, _result):
+        self.info.update(parse_kv(cli(["__info"])[1]))
+        self.update_view()
+        if self.info.get("remote_exists") == "1":
+            self.show_window()
+        elif not QSystemTrayIcon.isSystemTrayAvailable():
+            self.quit()
+
+    def quit(self):
+        self.qapp.quit()
+
+    def remote_command(self, cmd):
+        if cmd == "login":
+            self.login()
+        elif cmd == "prefs":
+            self.show_prefs()
+        elif cmd == "setup":
+            self.show_wizard()
+        elif cmd != "tray":
+            self.show_window()
+
+    # --- tray
+    def _build_menu(self):
+        m = self.menu
+        m.clear()
+        state = self.state()
+        a = m.addAction(dot_icon(state), STATE_LABELS[state])
+        a.setEnabled(False)
+        m.addSeparator()
+        mounted = state == "up"
+        a = m.addAction(tr("Unmount") if mounted else tr("Mount"), self.toggle_mount)
+        a.setEnabled(not self.busy)
+        a = m.addAction(tr("Open folder"), lambda: open_folder(self.info.get("mountpoint", "")))
+        a.setEnabled(mounted)
+        if not mounted and self.info.get("state") in ("auth", "password", "mailbox", "captcha"):
+            m.addAction(tr("Log in again…"), self.login)
+        m.addSeparator()
+        m.addAction(tr("Show Protux"), self.show_window)
+        m.addAction(tr("View log"), self.show_log)
+        m.addAction(tr("Preferences…"), self.show_prefs)
+        self.help.fill_menu(m.addMenu(tr("Help")))
+        m.addSeparator()
+        m.addAction(tr("Quit"), self.quit)
+
+    def _tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            if self.window.isVisible() and self.window.isActiveWindow():
+                self.window.hide()
+            else:
+                self.show_window()
+        elif reason == QSystemTrayIcon.ActivationReason.MiddleClick and self.info.get("mounted") == "1":
+            open_folder(self.info.get("mountpoint", ""))
+
+
+def main():
+    qapp = QApplication(sys.argv)
+    qapp.setApplicationName("protux")
+    qapp.setApplicationDisplayName(APP)
+    qapp.setDesktopFileName("io.github.frankmncrf.protux")
+    qapp.setWindowIcon(drive_qicon())
+    qapp.setQuitOnLastWindowClosed(False)
+    translator = QTranslator(qapp)
+    if UI_LANG != "en" and translator.load(QLocale(UI_LANG), "qtbase", "_",
+                                           QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)):
+        qapp.installTranslator(translator)
+
+    cmd = "login" if "--login" in sys.argv else "prefs" if "--preferences" in sys.argv else \
+        "setup" if "--setup" in sys.argv else "tray" if "--tray" in sys.argv else "show"
+    # single instance: a second launch passes its request to the running one
+    sock_name = f"protux-{os.getuid()}"
+    probe = QLocalSocket()
+    probe.connectToServer(sock_name)
+    if probe.waitForConnected(300):
+        probe.write(cmd.encode())
+        probe.waitForBytesWritten(300)
+        return 0
+    QLocalServer.removeServer(sock_name)
+    server = QLocalServer()
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+    server.listen(sock_name)
+
+    for _ in range(20):
+        if QSystemTrayIcon.isSystemTrayAvailable() or os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+            break
+        time.sleep(0.5)  # the panel may still be starting at login
+    app = Protux(qapp)
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: qapp.quit())
+    signal.signal(signal.SIGINT, lambda *_: qapp.quit())
+    wake = QTimer()
+    wake.timeout.connect(lambda: None)  # lets Python run signal handlers while Qt waits
+    wake.start(500)
+
+    def incoming():
+        conn = server.nextPendingConnection()
+        if conn is None:
+            return
+
+        def read():
+            app.remote_command(bytes(conn.readAll()).decode(errors="replace"))
+
+        conn.readyRead.connect(read)
+        conn.disconnected.connect(conn.deleteLater)
+        if conn.bytesAvailable():
+            read()
+
+    server.newConnection.connect(incoming)
+    if app.info.get("remote_exists") != "1":
+        app.show_wizard()
+    elif cmd == "login":
+        QTimer.singleShot(0, app.login)
+    elif cmd == "prefs":
+        QTimer.singleShot(0, app.show_prefs)
+    elif cmd == "setup":
+        app.show_wizard()
+    elif cmd == "show" or not app.settings.data.get("start_hidden", True) or \
+            not QSystemTrayIcon.isSystemTrayAvailable():
+        app.show_window()
+    return qapp.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

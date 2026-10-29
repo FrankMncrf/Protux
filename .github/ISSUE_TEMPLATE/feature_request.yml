@@ -1,0 +1,14 @@
+name: Feature request / Sugerencia
+description: An idea to make Protux better / Una idea para mejorar Protux
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like? / ¿Qué te gustaría?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why? / ¿Para qué?

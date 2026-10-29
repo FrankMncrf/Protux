@@ -1,0 +1,48 @@
+# protux configuration: ~/.config/protux/config
+# Bash syntax; every line is optional. The values shown are the defaults.
+
+# rclone remote (type protondrive) and where to mount it
+#REMOTE=ProtonDrive
+#MOUNTPOINT=/media/ProtonDrive
+
+# rclone binary and config file (point RCLONE at a pinned build if a new rclone breaks Proton)
+#RCLONE=rclone
+#RCLONE_CONFIG=$HOME/.config/rclone/rclone.conf
+
+# Encrypted rclone config: read its password from the Secret Service keyring
+# (GNOME Keyring, KWallet, KeePassXC...). auto = only if the config is encrypted.
+#KEYRING=auto
+#KEYRING_ATTRS="application protux purpose rclone-config"
+
+# VFS cache
+#CACHE_DIR=$HOME/.cache/protux
+#VFS_CACHE_MODE=writes
+#VFS_CACHE_MAX_SIZE=10G
+#VFS_CACHE_MAX_AGE=24h
+#VFS_WRITE_BACK=5s
+#DIR_CACHE_TIME=30s
+#BUFFER_SIZE=16M
+
+# Permissions. ALLOW_OTHER=yes lets other users (root, Docker, VMs) see the mount and
+# needs user_allow_other in /etc/fuse.conf
+#UMASK=077
+#ALLOW_OTHER=no
+
+#LOG_LEVEL=INFO
+# Any other rclone mount flags
+#EXTRA_ARGS=(--transfers=2)
+
+# Waits before mounting, and the pause after Proton rate-limits logins (HTTP 429)
+#NET_HOST=drive-api.proton.me
+#NET_TIMEOUT=180
+#KEYRING_TIMEOUT=240
+#RETRY_429_AFTER=65min
+
+# Max seconds per hook in ~/.config/protux/hooks/post-mount.d/
+#HOOK_TIMEOUT=120
+
+# File manager for "Open folder" (empty = the one your desktop uses: Thunar, Dolphin, Files...)
+#FILE_MANAGER=
+
+# How long a failure alert waits for a desktop session before giving up (seconds)
+#GUI_WAIT=3600

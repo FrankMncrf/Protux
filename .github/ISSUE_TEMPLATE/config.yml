@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ideas and questions / Ideas y preguntas
+    url: https://github.com/FrankMncrf/Protux/discussions
+    about: Open conversations with the community / Conversaciones abiertas con la comunidad
+  - name: Security vulnerability / Vulnerabilidad de seguridad
+    url: https://github.com/FrankMncrf/Protux/security/advisories/new
+    about: Report it privately / Repórtala en privado
