@@ -16,7 +16,7 @@ optdepends=('python-pyqt6: tray icon, window, setup wizard and preferences (prot
 backup=()
 install=protux.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('027b4d5bde278d39e5c732e11209091cf9eca5833b1c99f89c457b4da1b4f297')
 
 build() {
   cd "Protux-$pkgver"
